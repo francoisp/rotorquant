@@ -19,20 +19,9 @@ template <> __device__ float convert_from_float<float>(float value) { return val
 template <> __device__ at::BFloat16 convert_from_float<at::BFloat16>(float value) { return static_cast<at::BFloat16>(value); }
 
 /*
- * Sparse geometric product: rotor * multivector
+ * Sparse geometric product: rotor * multivector (rotor on LEFT)
  *
- * Rotor R in Cl(3,0) has only 4 non-zero components: [s, 0, 0, 0, b12, b13, b23, 0]
- * This eliminates ~50% of FMAs vs the full 8x8 product.
- *
- * Full Cl(3,0) multiplication table with e_i*e_i = +1:
- *   r0 = s*b0 - b12*x12 - b13*x13 - b23*x23
- *   r1 = s*b1 + b12*x2 + b13*x3 + b23*x123
- *   r2 = s*b2 - b12*x1 + b23*x3 - b13*x123
- *   r3 = s*b3 - b13*x1 - b23*x2 + b12*x123
- *   r4 = s*x12 + b12*x0
- *   r5 = s*x13 + b13*x0
- *   r6 = s*x23 + b23*x0
- *   r7 = s*x123 - b23*x1 + b13*x2 - b12*x3
+ * Computes R * x where R = [s, 0, 0, 0, p12, p13, p23, 0] in Cl(3,0).
  */
 __device__ void gp_rotor_mv(
     float s, float p12, float p13, float p23,
@@ -42,10 +31,32 @@ __device__ void gp_rotor_mv(
     r[1] = s*x[1] + p12*x[2] + p13*x[3] + p23*x[7];
     r[2] = s*x[2] - p12*x[1] + p23*x[3] - p13*x[7];
     r[3] = s*x[3] - p13*x[1] - p23*x[2] + p12*x[7];
-    r[4] = s*x[4] + p12*x[0];
-    r[5] = s*x[5] + p13*x[0];
-    r[6] = s*x[6] + p23*x[0];
+    r[4] = s*x[4] + p12*x[0] + p13*x[6] - p23*x[5];
+    r[5] = s*x[5] + p13*x[0] - p12*x[6] + p23*x[4];
+    r[6] = s*x[6] + p23*x[0] + p12*x[5] - p13*x[4];
     r[7] = s*x[7] - p23*x[1] + p13*x[2] - p12*x[3];
+}
+
+/*
+ * Sparse geometric product: multivector * rotor (rotor on RIGHT)
+ *
+ * Computes x * R where R = [s, 0, 0, 0, p12, p13, p23, 0] in Cl(3,0).
+ * NOTE: This is DIFFERENT from R * x in non-commutative Clifford algebra.
+ * The rotor sandwich R x R̃ = (R * x) * R̃ requires this right-product.
+ */
+__device__ void gp_mv_rotor(
+    const float x[8],
+    float s, float p12, float p13, float p23,
+    float r[8])
+{
+    r[0] = s*x[0] - p12*x[4] - p13*x[5] - p23*x[6];
+    r[1] = s*x[1] - p12*x[2] - p13*x[3] + p23*x[7];
+    r[2] = s*x[2] + p12*x[1] - p23*x[3] - p13*x[7];
+    r[3] = s*x[3] + p13*x[1] + p23*x[2] + p12*x[7];
+    r[4] = s*x[4] + p12*x[0] + p23*x[5] - p13*x[6];
+    r[5] = s*x[5] + p13*x[0] - p23*x[4] + p12*x[6];
+    r[6] = s*x[6] + p23*x[0] + p13*x[4] - p12*x[5];
+    r[7] = s*x[7] + p23*x[1] - p13*x[2] + p12*x[3];
 }
 
 __device__ float quantize_scalar(float val, const float* __restrict__ centroids, int levels)
@@ -124,10 +135,10 @@ __global__ void rotor_full_fused_kernel(
         if (d0 + 1 < emb_dim) x_mv[2] = convert_to_float(in_ptr[d0 + 1]);
         if (d0 + 2 < emb_dim) x_mv[3] = convert_to_float(in_ptr[d0 + 2]);
 
-        // Forward sandwich: temp = R * x, rotated = temp * R̃
+        // Forward sandwich: R x R̃ = (R * x) * R̃
         float temp[8], rotated[8];
-        gp_rotor_mv(s, p12, p13, p23, x_mv, temp);
-        gp_rotor_mv(s, -p12, -p13, -p23, temp, rotated);
+        gp_rotor_mv(s, p12, p13, p23, x_mv, temp);        // LEFT: R * x
+        gp_mv_rotor(temp, s, -p12, -p13, -p23, rotated);  // RIGHT: temp * R̃
 
         // Grade-aware quantization
         float q_mv[8];
@@ -140,10 +151,10 @@ __global__ void rotor_full_fused_kernel(
         q_mv[6] = quantize_scalar(rotated[6], sh_c_bivector, n_bivector);
         q_mv[7] = quantize_scalar(rotated[7], sh_c_trivector,n_trivector);
 
-        // Inverse sandwich: temp' = R̃ * q, final = temp' * R
+        // Inverse sandwich: R̃ q R = (R̃ * q) * R
         float temp2[8], final_mv[8];
-        gp_rotor_mv(s, -p12, -p13, -p23, q_mv, temp2);
-        gp_rotor_mv(s, p12, p13, p23, temp2, final_mv);
+        gp_rotor_mv(s, -p12, -p13, -p23, q_mv, temp2);    // LEFT: R̃ * q
+        gp_mv_rotor(temp2, s, p12, p13, p23, final_mv);    // RIGHT: temp2 * R
 
         // Extract vector grades back to output
         if (d0     < emb_dim) out_ptr[d0]     = convert_from_float<T>(final_mv[1]);
@@ -189,8 +200,8 @@ __global__ void rotor_sandwich_kernel(
         if (d0 + 2 < emb_dim) x_mv[3] = convert_to_float(in_ptr[d0 + 2]);
 
         float temp[8], rotated[8];
-        gp_rotor_mv(s, p12, p13, p23, x_mv, temp);
-        gp_rotor_mv(s, -p12, -p13, -p23, temp, rotated);
+        gp_rotor_mv(s, p12, p13, p23, x_mv, temp);        // LEFT: R * x
+        gp_mv_rotor(temp, s, -p12, -p13, -p23, rotated);  // RIGHT: temp * R̃
 
         int base = g * 8;
         #pragma unroll
@@ -235,8 +246,8 @@ __global__ void rotor_inverse_sandwich_kernel(
             q_mv[c] = convert_to_float(in_ptr[base + c]);
 
         float temp[8], final_mv[8];
-        gp_rotor_mv(s, -p12, -p13, -p23, q_mv, temp);
-        gp_rotor_mv(s, p12, p13, p23, temp, final_mv);
+        gp_rotor_mv(s, -p12, -p13, -p23, q_mv, temp);    // LEFT: R̃ * q
+        gp_mv_rotor(temp, s, p12, p13, p23, final_mv);    // RIGHT: temp * R
 
         int d0 = g * 3;
         if (d0     < emb_dim) out_ptr[d0]     = convert_from_float<T>(final_mv[1]);

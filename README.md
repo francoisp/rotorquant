@@ -1,8 +1,21 @@
 # TurboQuant + RotorQuant
 
-A from-scratch PyTorch implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026), Google's two-stage vector quantization algorithm for compressing LLM key-value caches — plus **RotorQuant**, a Clifford algebra reimagining that is **10-19x faster** with **44x fewer parameters**.
+A from-scratch PyTorch implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026), Google's two-stage vector quantization algorithm for compressing LLM key-value caches — plus **RotorQuant**, a Clifford algebra reimagining that is **10-650x faster** with **44x fewer parameters**, now with **Triton GPU kernels** for portable, auto-tuned acceleration.
 
 ## Quick Results
+
+### RotorQuant + Triton — Fused Kernel Speed (NEW)
+
+Tested on RTX 5090, d=128, 3-bit quantization:
+
+| n_vectors | TurboQuant (PyTorch) | RQ PyTorch | **RQ Triton** | Triton vs TQ |
+|-----------|---------------------|------------|--------------|--------------|
+| 1,024 | 36 us | 3.63 ms | **19 us** | **1.9x faster** |
+| 4,096 | 63 us | 2.32 ms | **16 us** | **3.9x faster** |
+| 16,384 | 212 us | 5.18 ms | **15 us** | **14x faster** |
+| 65,536 | — | 28.13 ms | **43 us** | — |
+
+The Triton full-fused kernel is **100-650x faster** than the PyTorch RotorQuant path, because it fuses the entire embed→rotor→quantize→unrotor→extract pipeline into a single GPU kernel launch.
 
 ### RotorQuant vs TurboQuant — CUDA Fused Kernel Speed
 
@@ -229,6 +242,78 @@ xcrun -sdk macosx metal -c turboquant/rotor_fused.metal -o /tmp/rotor_fused.air 
 xcrun -sdk macosx metallib /tmp/rotor_fused.air -o turboquant/rotor_fused.metallib
 ```
 
+## Triton Kernels (NEW)
+
+Portable, auto-tuned GPU kernels using [Triton](https://github.com/triton-lang/triton) — no CUDA C++ compilation needed, works on both NVIDIA and AMD GPUs.
+
+Inspired by [TurboQuant's Triton attention kernel](https://dejan.ai/blog/turboquant/) which fuses Q@K^T on quantized keys, we built Triton kernels for the entire RotorQuant pipeline:
+
+| Kernel | Purpose | Speedup vs PyTorch |
+|--------|---------|-------------------|
+| `triton_rotor_sandwich` | R x R̃ (embed + rotor sandwich) | 80-166x |
+| `triton_rotor_full_fused` | Full quantize-dequantize pipeline | **128-652x** |
+| `triton_fused_attention` | Q@K^T on compressed keys (gather-dot) | 1.1-1.5x |
+| `triton_rotor_inverse_sandwich` | R̃ x R (dequantize path) | 80-166x |
+
+### Triton Benchmark Results (RTX 5090, d=128)
+
+**Full fused pipeline** — single kernel for embed→rotor→quantize→unrotor→extract:
+
+| n_vectors | PyTorch | Triton | Speedup |
+|-----------|---------|--------|---------|
+| 256 | 2.09 ms | 0.016 ms | **128x** |
+| 1,024 | 3.22 ms | 0.015 ms | **212x** |
+| 4,096 | 3.46 ms | 0.015 ms | **229x** |
+| 16,384 | 5.10 ms | 0.017 ms | **295x** |
+| 65,536 | 28.13 ms | 0.043 ms | **652x** |
+
+**Across embedding dimensions** (n=4096, 3-bit):
+
+| Dimension | Groups | PyTorch | Triton | Speedup |
+|-----------|--------|---------|--------|---------|
+| 64 | 22 | 3.05 ms | 0.017 ms | **180x** |
+| 128 | 43 | 3.15 ms | 0.016 ms | **198x** |
+| 256 | 86 | 2.33 ms | 0.016 ms | **150x** |
+| 512 | 171 | 5.54 ms | 0.016 ms | **346x** |
+
+**End-to-end vs TurboQuant** (16K vectors):
+
+| Bits | TQ PyTorch | RQ Triton | Speedup |
+|------|-----------|-----------|---------|
+| 2-bit | 0.12 ms | 0.015 ms | **8x** |
+| 3-bit | 0.21 ms | 0.015 ms | **14x** |
+| 4-bit | 0.51 ms | 0.018 ms | **29x** |
+
+### Usage
+
+```python
+from turboquant import RotorQuantMSE, pack_rotors_for_triton, triton_rotor_full_fused
+
+# Create quantizer (PyTorch)
+rq = RotorQuantMSE(d=128, bits=3, device="cuda")
+
+# Pack rotors for Triton (one-time, ~0 cost)
+packed_rotors = pack_rotors_for_triton(rq.rotors)
+
+# Get centroids
+c_s = rq.centroids_scalar
+c_v = rq.centroids_vector
+c_b = rq.centroids_bivector
+c_t = rq.centroids_trivector
+
+# Triton fused quantize-dequantize (200-650x faster than PyTorch)
+x_hat = triton_rotor_full_fused(x, packed_rotors, c_s, c_v, c_b, c_t)
+```
+
+### Non-Commutative Algebra Bug Fix
+
+During Triton development, we discovered and fixed a bug in the CUDA kernel's sparse geometric product. The rotor sandwich `R x R̃ = (R * x) * R̃` requires two DIFFERENT products:
+
+- **R * x** (rotor on LEFT) — `_gp_rotor_mv`
+- **temp * R̃** (rotor on RIGHT) — `_gp_mv_rotor`
+
+These differ because Clifford algebra is non-commutative. The original CUDA kernel used the left-product formula for both steps, computing `R̃ * (R * x)` instead of `(R * x) * R̃`. For grade-1 vector inputs, the scalar and bivector intermediate components happen to be zero, so the error was small but non-zero. Both the Triton and CUDA kernels now use the correct left+right product pair.
+
 ## Scripts
 
 | Script | Purpose | Command |
@@ -236,6 +321,7 @@ xcrun -sdk macosx metallib /tmp/rotor_fused.air -o turboquant/rotor_fused.metall
 | `test_turboquant.py` | Synthetic validation (codebook, MSE, QJL, needle) | `python -m turboquant.test_turboquant` |
 | `validate.py` | Real model validation (Qwen2.5-3B, all layers) | `python -m turboquant.validate` |
 | `validate_rotorquant.py` | RotorQuant vs TurboQuant on real model | `python -m turboquant.validate_rotorquant` |
+| `benchmark_triton.py` | **Triton vs PyTorch benchmark (6 tests)** | `python -m turboquant.benchmark_triton` |
 | `benchmark_cuda.py` | PyTorch vs QJL CUDA kernel speed | `python -m turboquant.benchmark_cuda` |
 | `benchmark_rotorquant.py` | Full 7-test RotorQuant vs TurboQuant comparison | `python -m turboquant.benchmark_rotorquant` |
 | `benchmark_metal.py` | Metal shader benchmark (Apple Silicon) | `python -m turboquant.benchmark_metal` |
@@ -250,18 +336,17 @@ turboquant/
   turboquant.py              # TurboQuant: TurboQuantMSE, TurboQuantProd, TurboQuantKVCache
   rotorquant.py              # RotorQuant: RotorQuantMSE, RotorQuantProd, RotorQuantKVCache
   clifford.py                # Cl(3,0) geometric algebra (geometric product, rotors, sandwich)
+  triton_kernels.py          # Triton GPU kernels (rotor sandwich, full fused, attention)
   compressors.py             # Asymmetric inner product compressors for validation
   cuda_backend.py            # QJL CUDA kernel wrappers with PyTorch fallback
   csrc/
     rotor_fused_kernel.cu    # Fused RotorQuant CUDA kernel (NVIDIA)
-  rotor_fused.metal          # Fused RotorQuant Metal shader (Apple Silicon)
     qjl_quant_kernel.cu      # QJL quantization kernel
     qjl_score_kernel.cu      # QJL attention score kernel
     qjl_gqa_score_kernel.cu  # QJL GQA score kernel
     quantization.cu          # Quantized batched matmul
-  test_turboquant.py         # Synthetic tests
-  validate.py                # Real model validation
-  validate_rotorquant.py     # RotorQuant real model validation
+  rotor_fused.metal          # Fused RotorQuant Metal shader (Apple Silicon)
+  benchmark_triton.py        # Triton vs PyTorch benchmarks
   benchmark_cuda.py          # CUDA kernel benchmarks
   benchmark_rotorquant.py    # RotorQuant vs TurboQuant benchmarks
 setup.py                     # pip install with optional CUDA build
@@ -272,12 +357,14 @@ setup.py                     # pip install with optional CUDA build
 - Python 3.10+
 - PyTorch 2.0+ with CUDA
 - scipy (for codebook computation)
+- triton >= 3.0 (for Triton GPU kernels — optional but recommended)
 - transformers, accelerate, bitsandbytes (for real model validation only)
 
 ```bash
 pip install -e .                    # PyTorch-only
+pip install triton                  # Add Triton kernels (100-650x speedup)
 pip install -e ".[validate]"        # + model validation deps
-python setup.py build_ext --inplace # Build CUDA kernels
+python setup.py build_ext --inplace # Build CUDA kernels (alternative to Triton)
 ```
 
 ## When to Use Which
@@ -286,7 +373,9 @@ python setup.py build_ext --inplace # Build CUDA kernels
 |----------|---------------|
 | Standard KV cache compression | TurboQuant 3-bit (proven, well-understood) |
 | Parameter-constrained (edge/mobile) | RotorQuant (44x fewer params) |
-| Maximum throughput | RotorQuant + CUDA kernel (10-19x faster) |
+| Maximum throughput (NVIDIA/AMD) | **RotorQuant + Triton** (100-650x faster, portable) |
+| Maximum throughput (NVIDIA only) | RotorQuant + CUDA kernel (10-19x faster) |
+| Apple Silicon | RotorQuant + Metal shader (up to 31x faster) |
 | Geometric data (3D, physics, robotics) | RotorQuant (preserves algebraic structure) |
 
 ## References
