@@ -22,7 +22,7 @@ class TestRotorQuantMSE:
         rq = RotorQuantMSE(128, bits=3, seed=42)
         _, indices = rq(unit_vectors)
         assert isinstance(indices, dict)
-        assert set(indices.keys()) == {'scalar', 'vector', 'bivector', 'trivector'}
+        assert {'scalar', 'vector', 'bivector', 'trivector'}.issubset(indices.keys())
 
     @pytest.mark.parametrize("bits", [1, 2, 3, 4])
     def test_mse_within_bounds(self, unit_vectors, bits):

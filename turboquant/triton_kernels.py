@@ -268,14 +268,19 @@ def triton_rotor_full_fused(
     c_bivector: torch.Tensor,
     c_trivector: torch.Tensor,
 ) -> torch.Tensor:
-    """Fused RotorQuant pipeline: embed→rotor→quantize→unrotor→extract.
+    """Fused RotorQuant pipeline: normalize→embed→rotor→quantize→unrotor→extract→rescale.
 
     Single kernel launch for the full quantize-dequantize roundtrip.
+    Norm separation: normalizes to unit vectors before quantization,
+    then rescales output by original norms.
     """
     batch_size, emb_dim = input.shape
     n_groups = rotors.shape[0]
 
-    input_f32 = input.float().contiguous()
+    # Norm separation: quantize unit vectors, store norms
+    input_f32 = input.float()
+    norms = input_f32.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    input_f32 = (input_f32 / norms).contiguous()
     rotors_f32 = rotors.float().contiguous()
     c_s = c_scalar.float().contiguous()
     c_v = c_vector.float().contiguous()
@@ -297,6 +302,8 @@ def triton_rotor_full_fused(
         BLOCK_G=BLOCK_G,
     )
 
+    # Rescale by original norms
+    output = output * norms
     return output.to(input.dtype)
 
 

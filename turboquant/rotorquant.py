@@ -71,11 +71,23 @@ class RotorQuantMSE(nn.Module):
         self.grade_bits = grade_bits
 
         # Create per-grade codebooks
-        # Using d_eff = n_groups * 8 for the Lloyd-Max distribution parameter
-        d_eff = max(self.n_groups * MV_DIM, 64)
+        # The rotor sandwich embeds 3 dims into 8 MV components per group.
+        # After rotation, vector-grade components have variance ~1/d_original
+        # scaled by the embedding (3→8 spreading). The effective dimension
+        # that determines the post-rotor Gaussian σ is the ORIGINAL d,
+        # not the MV dimension, because the rotor preserves norms.
+        # Empirically: std ≈ 1/sqrt(d) for vector grades on unit-norm input.
+        d_eff_vector = d       # vector grades: σ ≈ 1/√d
+        d_eff_trivector = max(d // 2, 8)  # trivector: slightly wider distribution
+        d_eff_scalar = d * 4   # scalar grade: very narrow (near-zero for vectors)
         self.codebooks = nn.ModuleDict()
         for grade_name, gb in grade_bits.items():
-            cb = LloydMaxCodebook(d_eff, gb)
+            if grade_name == 'scalar':
+                cb = LloydMaxCodebook(d_eff_scalar, gb)
+            elif grade_name == 'trivector':
+                cb = LloydMaxCodebook(d_eff_trivector, gb)
+            else:
+                cb = LloydMaxCodebook(d_eff_vector, gb)
             self.register_buffer(f'centroids_{grade_name}',
                                  cb.centroids.to(device))
 
@@ -119,10 +131,14 @@ class RotorQuantMSE(nn.Module):
         Quantize vectors via rotor + grade-aware Lloyd-Max.
 
         x: (..., d) input vectors
-        Returns: (indices_dict, metadata)
+        Returns: (mv_q, indices_dict)
         """
+        # Normalize to unit vectors (store norms separately)
+        norms = torch.norm(x, dim=-1, keepdim=True).clamp(min=1e-8)
+        x_unit = x / norms
+
         # Embed as multivectors
-        mv = embed_vectors_as_multivectors(x)  # (..., n_groups, 8)
+        mv = embed_vectors_as_multivectors(x_unit)  # (..., n_groups, 8)
 
         # Apply rotor decorrelation
         mv_rot = self._apply_rotors(mv)
@@ -139,43 +155,48 @@ class RotorQuantMSE(nn.Module):
             mv_q[..., component_indices] = q_data
             all_indices[grade_name] = idx
 
+        # Store norms in indices for dequantize
+        all_indices['_norms'] = norms.squeeze(-1)
+
         return mv_q, all_indices
 
     def dequantize(self, indices: dict) -> torch.Tensor:
         """Reconstruct vectors from quantized indices."""
         sample_centroids = getattr(self, 'centroids_scalar')
-        # Infer batch shape: scalar indices are (batch..., n_groups * 1)
-        # so batch_shape is everything except the last dim
         scalar_idx = indices['scalar']
         flat_batch = scalar_idx.shape[0] if scalar_idx.dim() >= 1 else 1
-        # Number of total flattened scalar components = n_groups * 1
-        # So idx shape is (batch, n_groups * n_components_for_grade)
 
         mv_q = torch.zeros(flat_batch, self.n_groups, MV_DIM,
                            dtype=sample_centroids.dtype,
                            device=sample_centroids.device)
 
         for grade_name, component_indices in self.grade_map.items():
+            if grade_name.startswith('_'):
+                continue
             centroids = getattr(self, f'centroids_{grade_name}')
-            idx = indices[grade_name]  # (batch, n_groups * n_comps)
+            idx = indices[grade_name]
             values = centroids[idx]
             n_components = len(component_indices)
-            # Reshape: (batch, n_groups * n_comps) → (batch, n_groups, n_comps)
             values = values.reshape(flat_batch, self.n_groups, n_components)
             mv_q[..., component_indices] = values
 
         # Undo rotor rotation
         mv_recon = self._unapply_rotors(mv_q)
 
-        # Extract vectors
-        return extract_vectors_from_multivectors(mv_recon, self.d)
+        # Extract unit vectors and rescale by stored norms
+        x_hat = extract_vectors_from_multivectors(mv_recon, self.d)
+        if '_norms' in indices:
+            norms = indices['_norms']
+            if norms.dim() < x_hat.dim():
+                norms = norms.unsqueeze(-1)
+            x_hat = x_hat * norms
+
+        return x_hat
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict]:
         """Full quantize-dequantize cycle."""
         mv_q, indices = self.quantize(x)
-        # Undo rotor
-        mv_recon = self._unapply_rotors(mv_q)
-        x_hat = extract_vectors_from_multivectors(mv_recon, self.d)
+        x_hat = self.dequantize(indices)
         return x_hat, indices
 
 
