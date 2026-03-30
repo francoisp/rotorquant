@@ -1,14 +1,15 @@
 """
-RotorQuant High-Context POC
+IsoQuant High-Context POC
 
-Patches Qwen2.5-3B's KV cache with RotorQuant Triton-fused compression
+Patches Qwen2.5-3B's KV cache with IsoQuant Triton-fused compression
 and tests needle-in-haystack retrieval + generation at increasing context.
 
-Measures: VRAM, latency, attention fidelity, generation quality.
+Measures: VRAM, prefill tok/s, decode tok/s, attention fidelity, generation quality.
 
 Usage:
     python -m turboquant.poc_high_context
     python -m turboquant.poc_high_context --bits 3 --max-ctx 65536
+    python -m turboquant.poc_high_context --backend clifford  # legacy RotorQuant
 """
 
 import torch
@@ -22,16 +23,39 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from turboquant.isoquant import IsoQuantMSE
+from turboquant.triton_isoquant import triton_iso_fast_fused
+
+# Legacy Clifford path (--backend clifford)
 from turboquant.rotorquant import RotorQuantMSE
 from turboquant.triton_kernels import (
     triton_rotor_full_fused, pack_rotors_for_triton,
 )
 
 
-# ── RotorQuant KV cache compressor ──────────────────────────────────
+# ── KV cache compressor (IsoQuant or RotorQuant) ─────────────────────
+
+class IsoQuantKeyCompressor:
+    """Per-layer key compressor using IsoQuant-Fast + Triton fused kernel."""
+
+    def __init__(self, head_dim: int, bits: int, seed: int, device: str):
+        self.iq = IsoQuantMSE(head_dim, bits, seed=seed, mode='fast', device=device)
+        self.q_L = self.iq.q_L.to(device)
+        self.centroids = self.iq.centroids.to(device)
+        self.head_dim = head_dim
+        self.device = device
+
+    @torch.no_grad()
+    def compress_dequantize(self, keys: torch.Tensor) -> torch.Tensor:
+        B, H, S, D = keys.shape
+        orig_dtype = keys.dtype
+        flat = keys.reshape(-1, D)
+        flat_recon = triton_iso_fast_fused(flat, self.q_L, self.centroids)
+        return flat_recon.to(orig_dtype).reshape(B, H, S, D)
+
 
 class RotorQuantKeyCompressor:
-    """Per-layer key compressor using RotorQuant + Triton fused kernel."""
+    """Per-layer key compressor using RotorQuant + Triton fused kernel (legacy)."""
 
     def __init__(self, head_dim: int, bits: int, seed: int, device: str):
         self.rq = RotorQuantMSE(head_dim, bits, seed=seed, device=device)
@@ -43,65 +67,62 @@ class RotorQuantKeyCompressor:
 
     @torch.no_grad()
     def compress_dequantize(self, keys: torch.Tensor) -> torch.Tensor:
-        """Quantize → dequantize keys via Triton fused kernel.
-
-        Input:  (batch, n_kv_heads, seq_len, head_dim) float16/float32
-        Output: (batch, n_kv_heads, seq_len, head_dim) same dtype
-
-        The returned tensor is the MSE-optimal reconstruction.
-        """
         B, H, S, D = keys.shape
         orig_dtype = keys.dtype
-
-        # Flatten to (B*H*S, D) for the Triton kernel
         flat = keys.reshape(-1, D)
-
-        # Triton fused: embed→rotor→quantize→unrotor→extract
         flat_recon = triton_rotor_full_fused(
-            flat, self.packed_rotors,
-            None, self.c_v, None, self.c_t,
-        )
-
+            flat, self.packed_rotors, None, self.c_v, None, self.c_t)
         return flat_recon.to(orig_dtype).reshape(B, H, S, D)
 
 
-class RotorQuantValueCompressor:
-    """Per-layer value compressor using RotorQuant + Triton fused kernel."""
+class ValueCompressor:
+    """Per-layer value compressor — wraps either backend."""
 
-    def __init__(self, head_dim: int, bits: int, seed: int, device: str):
-        self.key_comp = RotorQuantKeyCompressor(head_dim, bits, seed, device)
+    def __init__(self, head_dim: int, bits: int, seed: int, device: str, backend: str = 'iso'):
+        if backend == 'iso':
+            self.inner = IsoQuantKeyCompressor(head_dim, bits, seed, device)
+        else:
+            self.inner = RotorQuantKeyCompressor(head_dim, bits, seed, device)
 
     @torch.no_grad()
     def compress_dequantize(self, values: torch.Tensor) -> torch.Tensor:
-        return self.key_comp.compress_dequantize(values)
+        return self.inner.compress_dequantize(values)
 
 
 # ── Patched KV cache ────────────────────────────────────────────────
 
-class RotorQuantPatchedCache:
+class PatchedCache:
     """Wraps HuggingFace DynamicCache to quantize keys/values on insertion."""
 
-    def __init__(self, bits: int, device: str, quantize_values: bool = True):
+    def __init__(self, bits: int, device: str, quantize_values: bool = True,
+                 backend: str = 'iso'):
         self.bits = bits
         self.device = device
         self.quantize_values = quantize_values
+        self.backend = backend
         self._key_compressors = {}
         self._val_compressors = {}
 
-    def get_key_compressor(self, layer_idx: int, head_dim: int) -> RotorQuantKeyCompressor:
+    def get_key_compressor(self, layer_idx: int, head_dim: int):
         if layer_idx not in self._key_compressors:
-            self._key_compressors[layer_idx] = RotorQuantKeyCompressor(
-                head_dim, self.bits, seed=layer_idx * 1000, device=self.device)
+            if self.backend == 'iso':
+                self._key_compressors[layer_idx] = IsoQuantKeyCompressor(
+                    head_dim, self.bits, seed=layer_idx * 1000, device=self.device)
+            else:
+                self._key_compressors[layer_idx] = RotorQuantKeyCompressor(
+                    head_dim, self.bits, seed=layer_idx * 1000, device=self.device)
         return self._key_compressors[layer_idx]
 
-    def get_val_compressor(self, layer_idx: int, head_dim: int) -> RotorQuantValueCompressor:
+    def get_val_compressor(self, layer_idx: int, head_dim: int):
         if layer_idx not in self._val_compressors:
-            self._val_compressors[layer_idx] = RotorQuantValueCompressor(
-                head_dim, self.bits, seed=layer_idx * 1000 + 500, device=self.device)
+            self._val_compressors[layer_idx] = ValueCompressor(
+                head_dim, self.bits, seed=layer_idx * 1000 + 500,
+                device=self.device, backend=self.backend)
         return self._val_compressors[layer_idx]
 
 
-def patch_model_kv_cache(model, bits: int = 4, quantize_values: bool = False):
+def patch_model_kv_cache(model, bits: int = 4, quantize_values: bool = False,
+                         backend: str = 'iso'):
     """Monkey-patch model's cache update for post-prefill RotorQuant compression.
 
     Strategy:
@@ -115,7 +136,7 @@ def patch_model_kv_cache(model, bits: int = 4, quantize_values: bool = False):
     """
     from transformers import DynamicCache
 
-    rq_cache = RotorQuantPatchedCache(bits, "cuda", quantize_values)
+    rq_cache = PatchedCache(bits, "cuda", quantize_values, backend=backend)
     prefill_done = {}  # per-layer tracking
 
     _original_update = DynamicCache.update
@@ -201,7 +222,7 @@ def build_prompt(tokenizer, target_tokens=2048, needle_pos=0.33):
 # ── Attention fidelity measurement ──────────────────────────────────
 
 @torch.no_grad()
-def measure_attention_fidelity(model, tokenizer, context_len, bits):
+def measure_attention_fidelity(model, tokenizer, context_len, bits, backend='iso'):
     """Compare RotorQuant attention scores vs FP16 on real KV cache.
 
     Returns dict with cosine_sim, top1_match, needle_found.
@@ -228,8 +249,11 @@ def measure_attention_fidelity(model, tokenizer, context_len, bits):
         keys = cache_fp16.layers[layer_idx].keys  # (1, H, S, D)
         B, H, S, D = keys.shape
 
-        # Compress keys with RotorQuant
-        compressor = RotorQuantKeyCompressor(D, bits, seed=layer_idx * 1000, device="cuda")
+        # Compress keys
+        if backend == 'iso':
+            compressor = IsoQuantKeyCompressor(D, bits, seed=layer_idx * 1000, device="cuda")
+        else:
+            compressor = RotorQuantKeyCompressor(D, bits, seed=layer_idx * 1000, device="cuda")
         keys_rq = compressor.compress_dequantize(keys)
 
         # Query = last token attending to all keys
@@ -269,10 +293,11 @@ def measure_attention_fidelity(model, tokenizer, context_len, bits):
 # ── Generation test ─────────────────────────────────────────────────
 
 @torch.no_grad()
-def test_generation(model, tokenizer, context_len, bits, max_new_tokens=50, keys_only=True):
-    """Generate text with RotorQuant-compressed KV cache.
+def test_generation(model, tokenizer, context_len, bits, max_new_tokens=50,
+                    keys_only=True, backend='iso'):
+    """Generate text with compressed KV cache.
 
-    Returns dict with generation, tokens/sec, VRAM usage, needle_found.
+    Returns dict with prefill_tok_s, decode_tok_s, VRAM usage, needle_found.
     """
     prompt = build_prompt(tokenizer, context_len)
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True,
@@ -286,10 +311,19 @@ def test_generation(model, tokenizer, context_len, bits, max_new_tokens=50, keys
     vram_before = torch.cuda.memory_allocated() / 1024**2
 
     # Patch KV cache
-    original_update, rq_cache = patch_model_kv_cache(model, bits=bits, quantize_values=not keys_only)
+    original_update, rq_cache = patch_model_kv_cache(
+        model, bits=bits, quantize_values=not keys_only, backend=backend)
 
     try:
-        t0 = time.perf_counter()
+        # Prefill: single forward pass on full prompt
+        t_prefill_start = time.perf_counter()
+        prefill_out = model(**inputs, use_cache=True)
+        torch.cuda.synchronize()
+        t_prefill = time.perf_counter() - t_prefill_start
+        prefill_tok_s = input_len / t_prefill if t_prefill > 0 else 0
+
+        # Decode: generate token by token
+        t_decode_start = time.perf_counter()
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -297,16 +331,18 @@ def test_generation(model, tokenizer, context_len, bits, max_new_tokens=50, keys
             use_cache=True,
         )
         torch.cuda.synchronize()
-        t_gen = time.perf_counter() - t0
+        t_total = time.perf_counter() - t_decode_start
 
         gen_tokens = outputs[0][input_len:]
         n_gen = len(gen_tokens)
         text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
 
+        # Decode speed: subtract prefill time from total
+        t_decode = t_total - t_prefill if t_total > t_prefill else t_total
+        decode_tok_s = n_gen / t_decode if t_decode > 0 else 0
+
         vram_peak = torch.cuda.max_memory_allocated() / 1024**2
         vram_kv = vram_peak - vram_before
-
-        tok_per_sec = n_gen / t_gen if t_gen > 0 else 0
 
         needle_found = "AURORA-7749" in text or "aurora" in text.lower()
 
@@ -318,8 +354,9 @@ def test_generation(model, tokenizer, context_len, bits, max_new_tokens=50, keys
         "input_tokens": input_len,
         "gen_tokens": n_gen,
         "text": text.strip(),
-        "tok_per_sec": tok_per_sec,
-        "time_s": t_gen,
+        "prefill_tok_s": prefill_tok_s,
+        "decode_tok_s": decode_tok_s,
+        "time_s": t_total,
         "vram_peak_mb": vram_peak,
         "vram_kv_est_mb": vram_kv,
         "needle_found": needle_found,
@@ -384,13 +421,17 @@ def main():
                         help="Only compress keys, leave values in fp16 (recommended)")
     parser.add_argument("--compress-values", dest="keys_only", action="store_false",
                         help="Also compress values (higher error)")
+    parser.add_argument("--backend", type=str, default="iso", choices=["iso", "clifford"],
+                        help="Rotation backend: iso (IsoQuant, default) or clifford (RotorQuant)")
     args = parser.parse_args()
+
+    backend_name = "IsoQuant" if args.backend == "iso" else "RotorQuant"
 
     print()
     print("=" * 74)
-    print("  RotorQuant High-Context POC")
+    print(f"  {backend_name} High-Context POC")
     print(f"  Model: {args.model}")
-    print(f"  Bits: {args.bits}  |  Max context: {args.max_ctx:,}  |  Keys only: {args.keys_only}")
+    print(f"  Bits: {args.bits}  |  Max context: {args.max_ctx:,}  |  Keys only: {args.keys_only}  |  Backend: {backend_name}")
     print(f"  GPU: {torch.cuda.get_device_name()}")
     print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     print("=" * 74)
@@ -443,7 +484,7 @@ def main():
                 print(f"  {ctx_len:>8,}  {'(skipped — needs 2x VRAM)':>40s}")
                 continue
             try:
-                result = measure_attention_fidelity(model, tokenizer, ctx_len, args.bits)
+                result = measure_attention_fidelity(model, tokenizer, ctx_len, args.bits, args.backend)
                 print(f"  {result['seq_len']:>8,}  {result['cosine_sim']:>12.6f}  "
                       f"{result['top1_match']:>10.1f}%  {result['n_layers']:>8d}")
             except torch.cuda.OutOfMemoryError:
@@ -453,9 +494,9 @@ def main():
 
         print()
 
-    # ── Phase 2: Generation with RotorQuant ──
+    # ── Phase 2: Generation with compressed KV cache ──
     print("=" * 74)
-    print(f"PHASE 2: Generation with RotorQuant ({args.bits}-bit KV cache)")
+    print(f"PHASE 2: Generation with {backend_name} ({args.bits}-bit KV cache)")
     print("=" * 74)
     print()
 
@@ -473,23 +514,25 @@ def main():
         baseline = None
     print()
 
-    # RotorQuant at each context length
-    print(f"  RotorQuant {args.bits}-bit results:")
+    # Compressed KV at each context length
+    print(f"  {backend_name} {args.bits}-bit results:")
     print()
-    print(f"  {'Context':>8s}  {'Speed':>10s}  {'VRAM Peak':>10s}  {'Needle':>8s}  {'Output (first 80 chars)'}")
-    print(f"  {'─'*8}  {'─'*10}  {'─'*10}  {'─'*8}  {'─'*40}")
+    print(f"  {'Context':>8s}  {'Prefill':>10s}  {'Decode':>10s}  {'VRAM':>8s}  {'Needle':>8s}  {'Output (first 60 chars)'}")
+    print(f"  {'─'*8}  {'─'*10}  {'─'*10}  {'─'*8}  {'─'*8}  {'─'*40}")
 
     for ctx_len in ctx_lengths:
         torch.cuda.empty_cache()
         gc.collect()
 
         try:
-            result = test_generation(model, tokenizer, ctx_len, args.bits, args.max_new_tokens, args.keys_only)
+            result = test_generation(model, tokenizer, ctx_len, args.bits,
+                                     args.max_new_tokens, args.keys_only, args.backend)
             needle_str = "FOUND" if result['needle_found'] else "MISS"
-            text_preview = result['text'][:80].replace('\n', ' ')
+            text_preview = result['text'][:60].replace('\n', ' ')
             print(f"  {result['input_tokens']:>8,}  "
-                  f"{result['tok_per_sec']:>8.1f}/s  "
-                  f"{result['vram_peak_mb']:>8.0f}MB  "
+                  f"{result['prefill_tok_s']:>8.1f}/s  "
+                  f"{result['decode_tok_s']:>8.1f}/s  "
+                  f"{result['vram_peak_mb']:>6.0f}MB  "
                   f"{needle_str:>8s}  "
                   f"{text_preview}")
         except torch.cuda.OutOfMemoryError:
