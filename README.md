@@ -10,10 +10,17 @@ Drop-in KV cache quantization using rotation-based decorrelation. **4-5x compres
 |----------|---------|-------------|---------------|-----|
 | **RTX 5090** | planar3 | **367** | **23,600** | 9.98 |
 | **RTX 5090** | iso3 | **367** | **23,600** | 9.98 |
-| RTX 5090 | FP16 | 356 | 20,800 | 9.98 |
+| RTX 5090 | FP16 | 356 | 20,800 | 10.03 |
 | M4 Mac Mini | planar3 | 48.3 | 554 | 9.98 |
 | M4 Mac Mini | FP16 | 47.4 | 518 | 9.98 |
-| M4 Mac Mini | turbo3 (roundtrip) | 33.9 | 387 | 180.3 |
+
+**Llama 3.1 8B (RTX 5090):**
+
+| Cache K | Decode tok/s | Prefill 2K | PPL |
+|---------|-------------|------------|-----|
+| planar3 | **239** | **13,030** | **8.44** |
+| iso3 | **239** | **13,050** | **8.44** |
+| FP16 | 229 | 9,360 | 8.44 |
 
 With deferred quantization, planar3/iso3 are **3% faster than FP16** (K-cache stays F16 during prefill, no dequant overhead in flash attention) and **PPL matches FP16 exactly**.
 
