@@ -378,7 +378,51 @@ pip install -e ".[validate]"        # + model validation deps (transformers, bit
 | KV cache compression (size) | IsoQuant-Fast 3-bit (4.9x, matches TQ) |
 | Long context on limited VRAM | PlanarQuant or IsoQuant-Fast 3-bit + post-prefill |
 | Triton kernel path needed | RotorQuant (Triton kernels available) |
-| Apple Silicon | RotorQuant + Metal shader |
+| Apple Silicon (llama.cpp) | **PlanarQuant `--cache-type-k planar3`** (see below) |
+
+## llama.cpp Metal Integration (Apple Silicon)
+
+PlanarQuant is available as a native KV cache type in our [llama.cpp fork](https://github.com/johndpope/llama-cpp-turboquant/tree/feature/planarquant-kv-cache), built on [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant).
+
+### Build
+
+```bash
+git clone https://github.com/johndpope/llama-cpp-turboquant.git
+cd llama-cpp-turboquant
+git checkout feature/planarquant-kv-cache
+
+cmake -B build -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+### Run
+
+```bash
+# Benchmark
+./build/bin/llama-bench -m model.gguf -ngl 99 -ctk planar3 -ctv planar3 -fa 1 -p 512,2048,8192 -n 64
+
+# Inference
+./build/bin/llama-server -m model.gguf --jinja -ngl 99 -fa on \
+    --cache-type-k planar3 --cache-type-v planar3 --host 0.0.0.0 --port 8080
+```
+
+### Benchmarks (M4 Mac Mini 24GB, Qwen2.5-3B Q4_K_M)
+
+| Cache Type | pp512 | pp2K | pp8K | pp16K | Decode (tg64) | vs FP16 decode |
+|-----------|-------|------|------|-------|---------------|----------------|
+| **FP16** | **518** | **459** | **380** | — | **47.4 tok/s** | 100% |
+| **planar3** | **525** | 443 | 313 | 236 | **40.8 tok/s** | **86%** |
+| turbo3 | 387 | 446 | 351 | — | 33.9 tok/s | 72% |
+| turbo4 | 441 | — | — | — | 36.4 tok/s | 77% |
+
+PlanarQuant decode is **20% faster than TurboQuant** (40.8 vs 33.9 tok/s) because the 2D Givens inverse rotation (4 FMAs per pair) is cheaper than the WHT inverse (7 butterfly stages on 128 elements). All cache types coexist — turbo2/3/4 and planar3 work side by side.
+
+### How it works
+
+The Metal shader implements the full PlanarQuant pipeline:
+- **Quantize** (`kernel_set_rows_planar3`): normalize → forward Givens rotation per pair → 3-bit Lloyd-Max quantize → pack indices
+- **Dequantize** (`dequantize_planar3_0`): unpack indices → centroid lookup → inverse Givens rotation → scale by norm
+- **Flash attention**: non-vec (prefill) + vec (decode) kernel instantiations for dk32–dk576
 
 ## References
 
