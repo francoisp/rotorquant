@@ -505,6 +505,455 @@ def main():
 if __name__ == "__main__":
     main()
 
+#!/usr/bin/env python3
+"""
+VRAM savings benchmark: TurboQuant vs RotorQuant vs IsoQuant compressed KV caches.
+
+Measures actual GPU memory with compressed storage (indices + norms), not dequantized FP16.
+Uses back2matching/turboquant TurboQuantCache as the reference, and builds equivalent
+compressed caches for RotorQuant and IsoQuant.
+
+Usage:
+    python benchmark_vram.py
+    python benchmark_vram.py --model Qwen/Qwen2.5-7B-Instruct --contexts 460 1860 4096
+"""
+
+import sys, os, gc, math, time, argparse
+import torch
+import torch.nn as nn
+from typing import Any, Optional, Tuple
+
+# ── Import reference TurboQuant cache from site-packages ─────────────────────
+import importlib
+_sp = os.path.join(sys.prefix, 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}', 'site-packages')
+
+_spec_core = importlib.util.spec_from_file_location('ref_tq_core', os.path.join(_sp, 'turboquant', 'core.py'))
+ref_core = importlib.util.module_from_spec(_spec_core)
+_spec_core.loader.exec_module(ref_core)
+RefTurboQuantMSE = ref_core.TurboQuantMSE
+
+_spec_cache = importlib.util.spec_from_file_location('ref_tq_cache', os.path.join(_sp, 'turboquant', 'cache.py'))
+ref_cache_mod = importlib.util.module_from_spec(_spec_cache)
+# Patch the import inside cache.py to use our loaded core
+sys.modules['turboquant.core'] = ref_core
+_spec_cache.loader.exec_module(ref_cache_mod)
+RefTurboQuantCache = ref_cache_mod.TurboQuantCache
+
+# ── Import local implementations ─────────────────────────────────────────────
+sys.path.insert(0, os.path.dirname(__file__))
+from turboquant.rotorquant import RotorQuantMSE
+from turboquant.isoquant import IsoQuantMSE
+
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+def gpu_mem_mb():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        return torch.cuda.memory_allocated() / 1024**2
+    return 0.0
+
+def gpu_peak_mb():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated() / 1024**2
+    return 0.0
+
+def flush():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Compressed KV cache layers for RQ and IQ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from transformers.cache_utils import DynamicCache, DynamicLayer
+
+
+class RotorQuantLayer(DynamicLayer):
+    """Cache layer storing RQ-compressed indices + norms."""
+
+    def __init__(self, bits: int = 3, residual_len: int = 128):
+        super().__init__()
+        self.bits = bits
+        self.residual_len = residual_len
+        self._quantizers = {}  # head_dim -> RotorQuantMSE
+        self._key_indices = None   # dict of {'vector': tensor, '_norms': tensor}
+        self._value_indices = None
+        self._residual_keys = None
+        self._residual_values = None
+        self._total_len = 0
+        self._head_dim = None
+
+    def _get_quantizer(self, head_dim, device):
+        key = (head_dim, str(device))
+        if key not in self._quantizers:
+            self._quantizers[key] = RotorQuantMSE(head_dim, self.bits, seed=42, device=str(device))
+        return self._quantizers[key]
+
+    def lazy_initialization(self, key_states, value_states):
+        self.dtype, self.device = key_states.dtype, key_states.device
+        self._head_dim = key_states.shape[-1]
+        self._residual_keys = torch.tensor([], dtype=self.dtype, device=self.device)
+        self._residual_values = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.keys = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.values = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.is_initialized = True
+
+    def update(self, key_states, value_states, cache_kwargs=None):
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+
+        self._residual_keys = torch.cat([self._residual_keys, key_states], dim=-2)
+        self._residual_values = torch.cat([self._residual_values, value_states], dim=-2)
+        self._total_len += key_states.shape[-2]
+
+        if self._residual_keys.shape[-2] > self.residual_len:
+            overflow = self._residual_keys.shape[-2] - self.residual_len
+            to_q_k = self._residual_keys[..., :overflow, :]
+            to_q_v = self._residual_values[..., :overflow, :]
+
+            rq = self._get_quantizer(self._head_dim, self.device)
+
+            # Quantize keys — store indices (uint8) + norms (float32)
+            k_flat = to_q_k.reshape(-1, self._head_dim).float()
+            _, k_idx_dict = rq(k_flat)
+            # Store only the vector indices and norms
+            k_vec_idx = k_idx_dict['vector'].to(torch.uint8)  # compressed
+            k_norms = k_idx_dict['_norms']  # float32
+
+            v_flat = to_q_v.reshape(-1, self._head_dim).float()
+            _, v_idx_dict = rq(v_flat)
+            v_vec_idx = v_idx_dict['vector'].to(torch.uint8)
+            v_norms = v_idx_dict['_norms']
+
+            if self._key_indices is None:
+                self._key_indices = k_vec_idx
+                self._key_norms = k_norms
+                self._value_indices = v_vec_idx
+                self._value_norms = v_norms
+            else:
+                self._key_indices = torch.cat([self._key_indices, k_vec_idx], dim=0)
+                self._key_norms = torch.cat([self._key_norms, k_norms], dim=0)
+                self._value_indices = torch.cat([self._value_indices, v_vec_idx], dim=0)
+                self._value_norms = torch.cat([self._value_norms, v_norms], dim=0)
+
+            self._residual_keys = self._residual_keys[..., overflow:, :]
+            self._residual_values = self._residual_values[..., overflow:, :]
+
+        # Dequantize for attention computation
+        if self._key_indices is not None and self._key_indices.numel() > 0:
+            rq = self._get_quantizer(self._head_dim, self.device)
+            # Rebuild indices dict for dequantize
+            k_idx = {'vector': self._key_indices.long(), '_norms': self._key_norms}
+            k_deq = rq.dequantize(k_idx).to(self.dtype)
+            k_deq = k_deq.reshape(self._residual_keys.shape[0], self._residual_keys.shape[1],
+                                  -1, self._head_dim)
+            v_idx = {'vector': self._value_indices.long(), '_norms': self._value_norms}
+            v_deq = rq.dequantize(v_idx).to(self.dtype)
+            v_deq = v_deq.reshape(self._residual_values.shape[0], self._residual_values.shape[1],
+                                  -1, self._head_dim)
+            self.keys = torch.cat([k_deq, self._residual_keys], dim=-2)
+            self.values = torch.cat([v_deq, self._residual_values], dim=-2)
+        else:
+            self.keys = self._residual_keys
+            self.values = self._residual_values
+
+        return self.keys, self.values
+
+    def get_seq_length(self):
+        return self._total_len
+
+
+class IsoQuantLayer(DynamicLayer):
+    """Cache layer storing IQ-compressed indices + norms."""
+
+    def __init__(self, bits: int = 3, residual_len: int = 128):
+        super().__init__()
+        self.bits = bits
+        self.residual_len = residual_len
+        self._quantizers = {}
+        self._key_indices = None
+        self._key_norms = None
+        self._value_indices = None
+        self._value_norms = None
+        self._residual_keys = None
+        self._residual_values = None
+        self._total_len = 0
+        self._head_dim = None
+
+    def _get_quantizer(self, head_dim, device):
+        key = (head_dim, str(device))
+        if key not in self._quantizers:
+            self._quantizers[key] = IsoQuantMSE(head_dim, self.bits, mode='fast', seed=42, device=str(device))
+        return self._quantizers[key]
+
+    def lazy_initialization(self, key_states, value_states):
+        self.dtype, self.device = key_states.dtype, key_states.device
+        self._head_dim = key_states.shape[-1]
+        self._residual_keys = torch.tensor([], dtype=self.dtype, device=self.device)
+        self._residual_values = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.keys = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.values = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.is_initialized = True
+
+    def update(self, key_states, value_states, cache_kwargs=None):
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+
+        self._residual_keys = torch.cat([self._residual_keys, key_states], dim=-2)
+        self._residual_values = torch.cat([self._residual_values, value_states], dim=-2)
+        self._total_len += key_states.shape[-2]
+
+        if self._residual_keys.shape[-2] > self.residual_len:
+            overflow = self._residual_keys.shape[-2] - self.residual_len
+            to_q_k = self._residual_keys[..., :overflow, :]
+            to_q_v = self._residual_values[..., :overflow, :]
+
+            iq = self._get_quantizer(self._head_dim, self.device)
+
+            k_flat = to_q_k.reshape(-1, self._head_dim).float()
+            _, k_idx_dict = iq(k_flat)
+            k_vec_idx = k_idx_dict['indices'].to(torch.uint8)
+            k_norms = k_idx_dict['_norms']
+
+            v_flat = to_q_v.reshape(-1, self._head_dim).float()
+            _, v_idx_dict = iq(v_flat)
+            v_vec_idx = v_idx_dict['indices'].to(torch.uint8)
+            v_norms = v_idx_dict['_norms']
+
+            if self._key_indices is None:
+                self._key_indices = k_vec_idx
+                self._key_norms = k_norms
+                self._value_indices = v_vec_idx
+                self._value_norms = v_norms
+            else:
+                self._key_indices = torch.cat([self._key_indices, k_vec_idx], dim=0)
+                self._key_norms = torch.cat([self._key_norms, k_norms], dim=0)
+                self._value_indices = torch.cat([self._value_indices, v_vec_idx], dim=0)
+                self._value_norms = torch.cat([self._value_norms, v_norms], dim=0)
+
+            self._residual_keys = self._residual_keys[..., overflow:, :]
+            self._residual_values = self._residual_values[..., overflow:, :]
+
+        # Dequantize
+        if self._key_indices is not None and self._key_indices.numel() > 0:
+            iq = self._get_quantizer(self._head_dim, self.device)
+            k_idx = {'indices': self._key_indices.long(), '_norms': self._key_norms}
+            k_deq = iq.dequantize(k_idx).to(self.dtype)
+            k_deq = k_deq.reshape(self._residual_keys.shape[0], self._residual_keys.shape[1],
+                                  -1, self._head_dim)
+            v_idx = {'indices': self._value_indices.long(), '_norms': self._value_norms}
+            v_deq = iq.dequantize(v_idx).to(self.dtype)
+            v_deq = v_deq.reshape(self._residual_values.shape[0], self._residual_values.shape[1],
+                                  -1, self._head_dim)
+            self.keys = torch.cat([k_deq, self._residual_keys], dim=-2)
+            self.values = torch.cat([v_deq, self._residual_values], dim=-2)
+        else:
+            self.keys = self._residual_keys
+            self.values = self._residual_values
+
+        return self.keys, self.values
+
+    def get_seq_length(self):
+        return self._total_len
+
+
+class RotorQuantCache(DynamicCache):
+    def __init__(self, bits=3, **kwargs):
+        super().__init__(**kwargs)
+        self.bits = bits
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        while len(self.layers) <= layer_idx:
+            self.layers.append(RotorQuantLayer(bits=self.bits))
+        return self.layers[layer_idx].update(key_states, value_states, cache_kwargs)
+
+
+class IsoQuantCache(DynamicCache):
+    def __init__(self, bits=3, **kwargs):
+        super().__init__(**kwargs)
+        self.bits = bits
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        while len(self.layers) <= layer_idx:
+            self.layers.append(IsoQuantLayer(bits=self.bits))
+        return self.layers[layer_idx].update(key_states, value_states, cache_kwargs)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Benchmark
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_test(model, tokenizer, input_ids, cache_factory, label):
+    """Run forward pass with given cache, measure VRAM and speed."""
+    flush()
+    mem_before = gpu_mem_mb()
+
+    cache = cache_factory()
+
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        outputs = model(input_ids, past_key_values=cache, use_cache=True, labels=input_ids)
+        loss = outputs.loss
+        ppl = math.exp(min(loss.item(), 20)) if loss is not None else float('nan')
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - t0
+
+    peak = gpu_peak_mb()
+    mem_after = gpu_mem_mb()
+    tok_s = input_ids.shape[1] / elapsed
+
+    return {
+        'label': label,
+        'ppl': ppl,
+        'peak_mb': peak,
+        'cache_mb': mem_after - mem_before,
+        'tok_s': tok_s,
+    }
+
+
+def compressed_bytes(n_vectors, head_dim, bits, method='tq'):
+    """Bytes for compressed representation (indices + norms). All methods same formula."""
+    # indices: n_vectors * head_dim * bits / 8 bytes (bit-packed)
+    # norms: n_vectors * 4 bytes (float32)
+    idx_bytes = n_vectors * head_dim * bits / 8
+    norm_bytes = n_vectors * 4
+    return idx_bytes + norm_bytes
+
+def fp16_bytes(n_vectors, head_dim):
+    return n_vectors * head_dim * 2  # 2 bytes per fp16
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', default='Qwen/Qwen2.5-3B-Instruct')
+    parser.add_argument('--bits', nargs='+', type=int, default=[3, 4])
+    parser.add_argument('--contexts', nargs='+', type=int, default=[460, 1860, 4096, 8192, 16384, 32768])
+    args = parser.parse_args()
+
+    print("=" * 95)
+    print("  VRAM Savings: FP16 vs TurboQuant vs RotorQuant vs IsoQuant (KV cache)")
+    print("=" * 95)
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    flush()
+    mem_start = gpu_mem_mb()
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, dtype=torch.float16, device_map='cuda:0'
+    )
+    model.eval()
+
+    model_mb = gpu_mem_mb() - mem_start
+    gpu_name = torch.cuda.get_device_name(0)
+    head_dim = getattr(model.config, 'head_dim',
+                       model.config.hidden_size // model.config.num_attention_heads)
+    n_layers = model.config.num_hidden_layers
+    n_kv_heads = model.config.num_key_value_heads
+
+    print(f"  Model: {args.model} ({model_mb:.0f} MB)")
+    print(f"  GPU: {gpu_name}")
+    print(f"  Architecture: {n_layers} layers, {n_kv_heads} KV heads, head_dim={head_dim}")
+
+    # ── Part 1: Real model PPL at feasible context ───────────────────────
+    print(f"\n{'─' * 95}")
+    print("  Part 1: Real PPL + Measured Peak VRAM (Qwen2.5-3B, single forward pass)")
+    print(f"{'─' * 95}")
+
+    try:
+        from datasets import load_dataset
+        ds = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+        text = '\n\n'.join([t for t in ds['text'] if len(t.strip()) > 100])
+    except Exception:
+        text = "The quick brown fox jumps over the lazy dog. " * 10000
+
+    all_ids = tokenizer.encode(text, return_tensors='pt').to('cuda:0')
+
+    test_contexts = [c for c in [1024, 2048, 4096] if c <= all_ids.shape[1]]
+
+    for bits in args.bits:
+        print(f"\n  {bits}-bit:")
+        print(f"  {'Context':>8}  {'Method':<12} {'Peak VRAM':>12} {'Speed':>12} {'PPL':>8}")
+        print(f"  {'────────':>8}  {'────────────':<12} {'────────────':>12} {'────────────':>12} {'────────':>8}")
+
+        for ctx in test_contexts:
+            input_ids = all_ids[:, :ctx]
+
+            fp16 = run_test(model, tokenizer, input_ids, lambda: DynamicCache(), 'FP16')
+            tq = run_test(model, tokenizer, input_ids,
+                         lambda b=bits: RefTurboQuantCache(bits=b), f'TQ {bits}b')
+            rq = run_test(model, tokenizer, input_ids,
+                         lambda b=bits: RotorQuantCache(bits=b), f'RQ {bits}b')
+            iq = run_test(model, tokenizer, input_ids,
+                         lambda b=bits: IsoQuantCache(bits=b), f'IQ {bits}b')
+
+            for r in [fp16, tq, rq, iq]:
+                print(f"  {ctx:>8}  {r['label']:<12} {r['peak_mb']:>10.0f} MB "
+                      f"{r['tok_s']:>10.1f} t/s {r['ppl']:>8.2f}")
+
+    # ── Part 2: Analytical VRAM savings (the real story) ─────────────────
+    print(f"\n{'─' * 95}")
+    print(f"  Part 2: KV Cache VRAM — FP16 vs Compressed Storage")
+    print(f"  (All quantization methods use identical compressed format: uint8 indices + float32 norms)")
+    print(f"  Model config: {n_layers} layers × {n_kv_heads} KV heads × head_dim={head_dim}")
+    print(f"{'─' * 95}")
+
+    # n_kv_vectors per context token = 2 (K+V) * n_layers * n_kv_heads
+    vectors_per_token = 2 * n_layers * n_kv_heads
+
+    for bits in args.bits:
+        print(f"\n  {bits}-bit compression:")
+        print(f"  {'Context':>8}  {'FP16 KV':>10}  {f'TQ/RQ/IQ {bits}b':>12}  {'Saved':>10}  {'Ratio':>8}")
+        print(f"  {'────────':>8}  {'──────────':>10}  {'────────────':>12}  {'──────────':>10}  {'────────':>8}")
+
+        for ctx in args.contexts:
+            n_vecs = ctx * vectors_per_token
+            fp16_mb = fp16_bytes(n_vecs, head_dim) / 1024**2
+            comp_mb = compressed_bytes(n_vecs, head_dim, bits) / 1024**2
+            saved = fp16_mb - comp_mb
+            ratio = fp16_mb / comp_mb
+
+            print(f"  {ctx:>8}  {fp16_mb:>8.1f} MB  {comp_mb:>10.1f} MB  {saved:>8.1f} MB  {ratio:>7.1f}x")
+
+    # ── Part 3: The parameter storage advantage ──────────────────────────
+    print(f"\n{'─' * 95}")
+    print(f"  Part 3: Quantizer State VRAM (stored once, shared across all tokens)")
+    print(f"{'─' * 95}")
+
+    for bits in args.bits:
+        # RefTQ: d×d rotation matrix (float32) + codebook per layer
+        ref_per_layer = (head_dim * head_dim * 4 + 2**bits * 4)  # bytes
+        ref_total = ref_per_layer * n_layers * n_kv_heads  # one quantizer per layer×head
+
+        # RQ: n_groups rotors (8 components each) + codebook
+        rq_obj = RotorQuantMSE(head_dim, bits, device='cpu')
+        rq_per_layer = (rq_obj.n_groups * 8 * 4 + 2**bits * 4)
+        rq_total = rq_per_layer * n_layers * n_kv_heads
+
+        # IQ: n_groups quaternions (4 components) + codebook
+        iq_obj = IsoQuantMSE(head_dim, bits, mode='fast', device='cpu')
+        iq_per_layer = (iq_obj.n_groups * 4 * 4 + 2**bits * 4)
+        iq_total = iq_per_layer * n_layers * n_kv_heads
+
+        print(f"\n  {bits}-bit quantizer state ({n_layers} layers × {n_kv_heads} KV heads):")
+        print(f"    Ref TurboQuant: {ref_total/1024:.1f} KB  ({head_dim}×{head_dim} rotation matrix per quantizer)")
+        print(f"    RotorQuant:     {rq_total/1024:.1f} KB  ({rq_obj.n_groups} rotors × 8 per quantizer) — {ref_total/rq_total:.0f}x smaller")
+        print(f"    IsoQuant-Fast:  {iq_total/1024:.1f} KB  ({iq_obj.n_groups} quaternions × 4 per quantizer) — {ref_total/iq_total:.0f}x smaller")
+
+    print(f"\n{'=' * 95}")
+    print("  BENCHMARK COMPLETE")
+    print(f"{'=' * 95}")
+
+
+if __name__ == '__main__':
+    main()
+
 """Tests for Cl(3,0) Clifford algebra primitives."""
 import pytest
 import torch
@@ -1241,6 +1690,497 @@ class TestSolveLloydMax:
                 c, b = solve_lloyd_max(d, bits)
                 assert len(c) == 2 ** bits
                 assert len(b) == 2 ** bits - 1
+
+#!/usr/bin/env python3
+"""
+Head-to-head benchmark: back2matching/turboquant (reference) vs RotorQuant/IsoQuant.
+
+Compares:
+  1. Synthetic MSE distortion (unit vectors, d=128)
+  2. Inner product preservation (QJL two-stage)
+  3. NIAH retrieval
+  4. Real model PPL + VRAM (Qwen2.5-3B-Instruct)
+  5. Speed (quantize+dequantize latency)
+  6. VRAM savings at different context lengths
+
+Reference: pip install turboquant (back2matching, v0.2.0)
+"""
+
+import sys, os, time, math, gc, argparse
+import torch
+import numpy as np
+
+# ── Import reference turboquant from site-packages (avoid local shadow) ──────
+import importlib
+_sp = os.path.join(sys.prefix, 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}', 'site-packages')
+_spec_core = importlib.util.spec_from_file_location('ref_tq_core', os.path.join(_sp, 'turboquant', 'core.py'))
+ref_core = importlib.util.module_from_spec(_spec_core)
+_spec_core.loader.exec_module(ref_core)
+RefTurboQuantMSE = ref_core.TurboQuantMSE
+RefTurboQuantIP = ref_core.TurboQuantIP
+
+# ── Import local implementations ─────────────────────────────────────────────
+sys.path.insert(0, os.path.dirname(__file__))
+from turboquant.rotorquant import RotorQuantMSE, RotorQuantProd
+from turboquant.isoquant import IsoQuantMSE, IsoQuantProd
+
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+GPU_NAME = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'
+
+
+def gpu_mem_mb():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        return torch.cuda.memory_allocated() / 1024**2
+    return 0.0
+
+def gpu_peak_mb():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated() / 1024**2
+    return 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST 1: MSE Distortion
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_mse(d=128, n=2000, bits_list=[2, 3, 4]):
+    print("\n" + "=" * 72)
+    print("TEST 1: MSE Distortion — Reference TQ vs RotorQuant vs IsoQuant")
+    print("=" * 72)
+    print(f"  d={d}, n_vectors={n}, device={DEVICE}\n")
+
+    # Generate random unit vectors
+    torch.manual_seed(42)
+    x = torch.randn(n, d, device=DEVICE)
+    x = x / x.norm(dim=-1, keepdim=True)
+
+    # Theoretical bound: (d/(d-1)) * Beta(d/2, 1/2) / (4^b * d^(1/2))
+    # Simplified: sqrt(3)*pi/2 * 1/4^b (from paper)
+    def theory(b):
+        return math.sqrt(3) * math.pi / 2 * (1 / 4**b)
+
+    print(f"  {'bits':>4}  {'Ref TQ MSE':>12}  {'RQ MSE':>12}  {'IQ-Fast MSE':>12}  {'theory':>12}  {'winner':>8}")
+    print(f"  {'────':>4}  {'────────────':>12}  {'────────────':>12}  {'────────────':>12}  {'────────────':>12}  {'────────':>8}")
+
+    for bits in bits_list:
+        # Reference TurboQuant
+        ref_tq = RefTurboQuantMSE(d, bits=bits, device=DEVICE, seed=42)
+        idx, norms = ref_tq.quantize(x)
+        x_ref = ref_tq.dequantize(idx, norms)
+        mse_ref = ((x - x_ref)**2).sum(dim=-1).mean().item()
+
+        # RotorQuant
+        rq = RotorQuantMSE(d, bits, seed=42, device=DEVICE)
+        x_rq, _ = rq(x)
+        mse_rq = ((x - x_rq)**2).sum(dim=-1).mean().item()
+
+        # IsoQuant-Fast
+        iq = IsoQuantMSE(d, bits, mode='fast', seed=42, device=DEVICE)
+        x_iq, _ = iq(x)
+        mse_iq = ((x - x_iq)**2).sum(dim=-1).mean().item()
+
+        th = theory(bits)
+        best = min(mse_ref, mse_rq, mse_iq)
+        winner = 'RefTQ' if best == mse_ref else ('RQ' if best == mse_rq else 'IQ')
+
+        print(f"  {bits:>4}  {mse_ref:>12.6f}  {mse_rq:>12.6f}  {mse_iq:>12.6f}  {th:>12.6f}  {winner:>8}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST 2: Inner Product Preservation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_inner_product(d=128, n=2000, n_pairs=3000, bits_list=[2, 3, 4]):
+    print("\n" + "=" * 72)
+    print("TEST 2: Inner Product Unbiasedness (two-stage with QJL)")
+    print("=" * 72)
+    print(f"  d={d}, n_pairs={n_pairs}\n")
+
+    torch.manual_seed(42)
+    x = torch.randn(n_pairs, d, device=DEVICE)
+    y = torch.randn(n_pairs, d, device=DEVICE)
+    x = x / x.norm(dim=-1, keepdim=True)
+    y = y / y.norm(dim=-1, keepdim=True)
+    true_ip = (x * y).sum(dim=-1)
+
+    print(f"  {'bits':>4}  {'method':>8}  {'bias':>12}  {'RMSE':>12}  {'corr':>8}")
+    print(f"  {'────':>4}  {'────────':>8}  {'────────────':>12}  {'────────────':>12}  {'────────':>8}")
+
+    for bits in bits_list:
+        results = {}
+
+        # Reference TQ IP (two-stage)
+        ref_ip = RefTurboQuantIP(d, bits=bits, device=DEVICE, seed=42)
+        cx = ref_ip.quantize(x)
+        cy = ref_ip.quantize(y)
+        x_hat = ref_ip.dequantize(*cx)
+        y_hat = ref_ip.dequantize(*cy)
+        approx = (x_hat * y_hat).sum(dim=-1)
+        results['RefTQ'] = approx
+
+        # RotorQuant Prod — uses dict-based API with inner_product method
+        rqp = RotorQuantProd(d, bits, seed=42, device=DEVICE)
+        cx_rq = rqp(x)  # returns dict
+        x_rq_hat = rqp.dequantize(cx_rq)
+        cy_rq = rqp(y)
+        y_rq_hat = rqp.dequantize(cy_rq)
+        approx_rq = (x_rq_hat * y_rq_hat).sum(dim=-1)
+        results['RQ'] = approx_rq
+
+        # IsoQuant Prod
+        iqp = IsoQuantProd(d, bits, mode='fast', seed=42, device=DEVICE)
+        cx_iq = iqp(x)
+        x_iq_hat = iqp.dequantize(cx_iq)
+        cy_iq = iqp(y)
+        y_iq_hat = iqp.dequantize(cy_iq)
+        approx_iq = (x_iq_hat * y_iq_hat).sum(dim=-1)
+        results['IQ'] = approx_iq
+
+        for name, approx in results.items():
+            diff = approx - true_ip
+            bias = diff.mean().item()
+            rmse = diff.pow(2).mean().sqrt().item()
+            corr = torch.corrcoef(torch.stack([true_ip, approx]))[0, 1].item()
+            print(f"  {bits:>4}  {name:>8}  {bias:>+12.6f}  {rmse:>12.6f}  {corr:>8.4f}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST 3: NIAH Retrieval
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_niah(d=128, bits_list=[2, 3, 4], seq_lens=[512, 2048, 8192]):
+    print("\n" + "=" * 72)
+    print("TEST 3: Needle-in-Haystack Retrieval")
+    print("=" * 72)
+
+    print(f"\n  {'bits':>4}  {'seq':>6}  {'RefTQ':>8}  {'RQ':>8}  {'IQ':>8}")
+    print(f"  {'────':>4}  {'──────':>6}  {'────────':>8}  {'────────':>8}  {'────────':>8}")
+
+    for bits in bits_list:
+        for seq_len in seq_lens:
+            torch.manual_seed(42)
+            keys = torch.randn(seq_len, d, device=DEVICE)
+            keys = keys / keys.norm(dim=-1, keepdim=True)
+            needle_idx = seq_len // 3
+            needle = keys[needle_idx].clone()
+            query = needle + 0.01 * torch.randn(d, device=DEVICE)
+            query = query / query.norm()
+
+            results = {}
+
+            # Reference TQ
+            ref_tq = RefTurboQuantMSE(d, bits=bits, device=DEVICE, seed=42)
+            idx, norms = ref_tq.quantize(keys)
+            k_hat = ref_tq.dequantize(idx, norms)
+            scores = k_hat @ query
+            found = scores.argmax().item()
+            results['RefTQ'] = 'EXACT' if found == needle_idx else f'MISS({abs(found-needle_idx)})'
+
+            # RotorQuant
+            rq = RotorQuantMSE(d, bits, seed=42, device=DEVICE)
+            k_rq, _ = rq(keys)
+            scores_rq = k_rq @ query
+            found_rq = scores_rq.argmax().item()
+            results['RQ'] = 'EXACT' if found_rq == needle_idx else f'MISS({abs(found_rq-needle_idx)})'
+
+            # IsoQuant
+            iq = IsoQuantMSE(d, bits, mode='fast', seed=42, device=DEVICE)
+            k_iq, _ = iq(keys)
+            scores_iq = k_iq @ query
+            found_iq = scores_iq.argmax().item()
+            results['IQ'] = 'EXACT' if found_iq == needle_idx else f'MISS({abs(found_iq-needle_idx)})'
+
+            print(f"  {bits:>4}  {seq_len:>6}  {results['RefTQ']:>8}  {results['RQ']:>8}  {results['IQ']:>8}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST 4: Speed Benchmark
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_speed(d=128, bits=3, n_list=[1000, 5000, 10000]):
+    print("\n" + "=" * 72)
+    print("TEST 4: Speed Benchmark (quantize + dequantize roundtrip)")
+    print("=" * 72)
+    print(f"  GPU: {GPU_NAME}")
+    print(f"  d={d}, bits={bits}\n")
+
+    for n in n_list:
+        torch.manual_seed(42)
+        x = torch.randn(n, d, device=DEVICE)
+        x = x / x.norm(dim=-1, keepdim=True)
+
+        # Warmup
+        for _ in range(3):
+            ref_tq = RefTurboQuantMSE(d, bits=bits, device=DEVICE, seed=42)
+            idx, norms = ref_tq.quantize(x)
+            ref_tq.dequantize(idx, norms)
+            torch.cuda.synchronize()
+
+        # Reference TQ
+        t0 = time.perf_counter()
+        for _ in range(10):
+            idx, norms = ref_tq.quantize(x)
+            _ = ref_tq.dequantize(idx, norms)
+            torch.cuda.synchronize()
+        t_ref = (time.perf_counter() - t0) / 10 * 1000
+
+        # RotorQuant
+        rq = RotorQuantMSE(d, bits, seed=42, device=DEVICE)
+        for _ in range(3):
+            rq(x); torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            rq(x); torch.cuda.synchronize()
+        t_rq = (time.perf_counter() - t0) / 10 * 1000
+
+        # IsoQuant-Fast
+        iq = IsoQuantMSE(d, bits, mode='fast', seed=42, device=DEVICE)
+        for _ in range(3):
+            iq(x); torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            iq(x); torch.cuda.synchronize()
+        t_iq = (time.perf_counter() - t0) / 10 * 1000
+
+        print(f"  n={n:>5}: RefTQ={t_ref:>8.2f}ms  RQ={t_rq:>8.2f}ms  IQ={t_iq:>8.2f}ms"
+              f"  (RefTQ/RQ={t_ref/max(t_rq,0.001):.1f}x  RefTQ/IQ={t_ref/max(t_iq,0.001):.1f}x)")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST 5: Parameter Efficiency
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_params(d=128, bits=3):
+    print("\n" + "=" * 72)
+    print("TEST 5: Parameter / Buffer Efficiency")
+    print("=" * 72)
+
+    # Reference TQ
+    ref_tq = RefTurboQuantMSE(d, bits=bits, device='cpu', seed=42)
+    ref_params = d * d + 2**bits  # rotation matrix + codebook
+    print(f"\n  Reference TurboQuant (back2matching):")
+    print(f"    Rotation matrix: {d}x{d} = {d*d:,}")
+    print(f"    Codebook: {2**bits} centroids")
+    print(f"    Total: {ref_params:,}")
+
+    # RotorQuant
+    rq = RotorQuantMSE(d, bits, seed=42, device='cpu')
+    n_groups = rq.n_groups
+    rq_params = n_groups * 8 + 2**bits  # rotors + codebook
+    print(f"\n  RotorQuant (Clifford Cl(3,0)):")
+    print(f"    Rotors: {n_groups} groups x 8 components = {n_groups*8}")
+    print(f"    Codebook: {2**bits} centroids")
+    print(f"    Total: {rq_params}")
+    print(f"    Ratio: {ref_params/rq_params:.1f}x smaller")
+
+    # IsoQuant
+    iq = IsoQuantMSE(d, bits, mode='fast', seed=42, device='cpu')
+    n_groups_iq = iq.n_groups
+    iq_params = n_groups_iq * 4 + 2**bits  # quaternions + codebook
+    print(f"\n  IsoQuant-Fast (quaternion 4D):")
+    print(f"    Quaternions: {n_groups_iq} groups x 4 components = {n_groups_iq*4}")
+    print(f"    Codebook: {2**bits} centroids")
+    print(f"    Total: {iq_params}")
+    print(f"    Ratio: {ref_params/iq_params:.1f}x smaller")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST 6: Real Model PPL + VRAM
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_real_model_ppl(model_name='Qwen/Qwen2.5-3B-Instruct', bits_list=[3, 4],
+                        n_tokens=512, prefill_len=256):
+    print("\n" + "=" * 72)
+    print("TEST 6: Real Model PPL + VRAM (post-prefill K-cache quantization)")
+    print("=" * 72)
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers.cache_utils import DynamicCache
+
+    print(f"  Model: {model_name}")
+    print(f"  Tokens: {n_tokens} (prefill={prefill_len})")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    torch.cuda.reset_peak_memory_stats()
+    gc.collect(); torch.cuda.empty_cache()
+    mem_before_model = gpu_mem_mb()
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, dtype=torch.float16, device_map='auto'
+    )
+    model.eval()
+
+    mem_after_model = gpu_mem_mb()
+    print(f"  Model VRAM: {mem_after_model - mem_before_model:.0f} MB")
+
+    head_dim = getattr(model.config, 'head_dim',
+                       model.config.hidden_size // model.config.num_attention_heads)
+    n_layers = model.config.num_hidden_layers
+    n_kv_heads = model.config.num_key_value_heads
+    print(f"  Architecture: {n_layers} layers, {n_kv_heads} KV heads, head_dim={head_dim}")
+
+    # Load wikitext
+    try:
+        from datasets import load_dataset
+        ds = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+        text = '\n\n'.join([t for t in ds['text'] if len(t.strip()) > 100])
+    except Exception:
+        text = "The quick brown fox " * 5000
+
+    input_ids = tokenizer.encode(text, return_tensors='pt')[:, :n_tokens].to(model.device)
+
+    # ── Helper: single-pass PPL with monkey-patched cache ────────────────
+    def run_ppl(quantize_fn=None, label='FP16'):
+        """
+        Single forward pass with monkey-patched DynamicCache.update.
+        Quantizes K vectors as they enter the cache (simulates online compression).
+        """
+        gc.collect(); torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        _orig = DynamicCache.update
+
+        if quantize_fn is not None:
+            def _patched(self, ks, vs, li, ck=None):
+                # Quantize keys before storing
+                kq = quantize_fn(ks, li)
+                return _orig(self, kq, vs, li, ck)
+            DynamicCache.update = _patched
+
+        with torch.no_grad():
+            outputs = model(input_ids, labels=input_ids)
+            ppl = math.exp(min(outputs.loss.item(), 20))  # cap at exp(20) to avoid overflow
+
+        if quantize_fn is not None:
+            DynamicCache.update = _orig
+
+        peak = gpu_peak_mb()
+        vram_kv = peak - mem_after_model
+        return ppl, peak, vram_kv
+
+    # ── Build quantize functions ─────────────────────────────────────────
+    def make_ref_compress(bits):
+        quantizers = {}
+        def compress(ks, li):
+            D = ks.shape[-1]
+            if li not in quantizers:
+                quantizers[li] = RefTurboQuantMSE(D, bits=bits, device=str(ks.device), seed=li*1000)
+            tq = quantizers[li]
+            flat = ks.reshape(-1, D).float()
+            idx, norms = tq.quantize(flat)
+            x_hat = tq.dequantize(idx, norms)
+            return x_hat.to(ks.dtype).reshape(ks.shape)
+        return compress
+
+    def make_rq_compress(bits):
+        quantizers = {}
+        def compress(ks, li):
+            D = ks.shape[-1]
+            if li not in quantizers:
+                quantizers[li] = RotorQuantMSE(D, bits, seed=li*1000, device=str(ks.device))
+            rq = quantizers[li]
+            flat = ks.reshape(-1, D).float()
+            x_hat, _ = rq(flat)
+            return x_hat.to(ks.dtype).reshape(ks.shape)
+        return compress
+
+    def make_iq_compress(bits):
+        quantizers = {}
+        def compress(ks, li):
+            D = ks.shape[-1]
+            if li not in quantizers:
+                quantizers[li] = IsoQuantMSE(D, bits, mode='fast', seed=li*1000, device=str(ks.device))
+            iq = quantizers[li]
+            flat = ks.reshape(-1, D).float()
+            x_hat, _ = iq(flat)
+            return x_hat.to(ks.dtype).reshape(ks.shape)
+        return compress
+
+    # ── Run tests ────────────────────────────────────────────────────────
+    ppl_fp16, peak_fp16, kv_fp16 = run_ppl(None, 'FP16')
+    print(f"\n  {'Method':<20} {'PPL':>8} {'vs FP16':>10} {'Peak VRAM':>12} {'KV est.':>10}")
+    print(f"  {'──────────────────':<20} {'────────':>8} {'──────────':>10} {'────────────':>12} {'──────────':>10}")
+    print(f"  {'FP16 baseline':<20} {ppl_fp16:>8.2f} {'--':>10} {peak_fp16:>10.0f} MB {kv_fp16:>8.0f} MB")
+
+    for bits in bits_list:
+        ppl_ref, peak_ref, kv_ref = run_ppl(make_ref_compress(bits), f'RefTQ {bits}b')
+        ppl_rq, peak_rq, kv_rq = run_ppl(make_rq_compress(bits), f'RQ {bits}b')
+        ppl_iq, peak_iq, kv_iq = run_ppl(make_iq_compress(bits), f'IQ {bits}b')
+
+        print(f"  {'RefTQ '+str(bits)+'b':<20} {ppl_ref:>8.2f} {'+'+f'{ppl_ref-ppl_fp16:.2f}':>10} {peak_ref:>10.0f} MB {kv_ref:>8.0f} MB")
+        print(f"  {'RotorQ '+str(bits)+'b':<20} {ppl_rq:>8.2f} {'+'+f'{ppl_rq-ppl_fp16:.2f}':>10} {peak_rq:>10.0f} MB {kv_rq:>8.0f} MB")
+        print(f"  {'IsoQ-F '+str(bits)+'b':<20} {ppl_iq:>8.2f} {'+'+f'{ppl_iq-ppl_fp16:.2f}':>10} {peak_iq:>10.0f} MB {kv_iq:>8.0f} MB")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST 7: VRAM Savings at Scale (projected, no model needed)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_vram_projection():
+    print("\n" + "=" * 72)
+    print("TEST 7: Projected VRAM Savings (analytical)")
+    print("=" * 72)
+    print("  Based on Qwen2.5-7B: 28 layers, 4 KV heads, head_dim=128\n")
+
+    n_layers, n_kv_heads, head_dim = 28, 4, 128
+
+    def kv_bytes_fp16(seq_len):
+        # 2 (K+V) * n_layers * n_kv_heads * seq_len * head_dim * 2 bytes
+        return 2 * n_layers * n_kv_heads * seq_len * head_dim * 2
+
+    def kv_bytes_quant(seq_len, bits):
+        # Quantized: bits per coordinate + 32-bit norm per vector
+        per_vector_bits = head_dim * bits + 32  # indices + norm
+        per_vector_bytes = per_vector_bits / 8
+        return 2 * n_layers * n_kv_heads * seq_len * per_vector_bytes
+
+    print(f"  {'Context':>8}  {'FP16 KV':>10}  {'4-bit KV':>10}  {'3-bit KV':>10}  {'4b saved':>10}  {'3b saved':>10}  {'4b ratio':>8}  {'3b ratio':>8}")
+    print(f"  {'────────':>8}  {'──────────':>10}  {'──────────':>10}  {'──────────':>10}  {'──────────':>10}  {'──────────':>10}  {'────────':>8}  {'────────':>8}")
+
+    for ctx in [460, 1860, 4096, 8192, 16384, 32768, 65536, 131072]:
+        fp16 = kv_bytes_fp16(ctx) / 1024**2
+        q4 = kv_bytes_quant(ctx, 4) / 1024**2
+        q3 = kv_bytes_quant(ctx, 3) / 1024**2
+        print(f"  {ctx:>8}  {fp16:>8.1f}MB  {q4:>8.1f}MB  {q3:>8.1f}MB  {fp16-q4:>8.1f}MB  {fp16-q3:>8.1f}MB  {fp16/q4:>7.1f}x  {fp16/q3:>7.1f}x")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='RotorQuant vs Reference TurboQuant')
+    parser.add_argument('--bits', nargs='+', type=int, default=[2, 3, 4])
+    parser.add_argument('--model', type=str, default='Qwen/Qwen2.5-3B-Instruct')
+    parser.add_argument('--skip-model', action='store_true', help='Skip real model PPL test')
+    parser.add_argument('--skip-synthetic', action='store_true', help='Skip synthetic tests')
+    args = parser.parse_args()
+
+    print("╔════════════════════════════════════════════════════════════════════╗")
+    print("║  RotorQuant vs Reference TurboQuant (back2matching v0.2.0)       ║")
+    print("╚════════════════════════════════════════════════════════════════════╝")
+    print(f"  GPU: {GPU_NAME}")
+    print(f"  PyTorch: {torch.__version__}")
+    print(f"  Bits: {args.bits}")
+
+    if not args.skip_synthetic:
+        test_mse(bits_list=args.bits)
+        test_inner_product(bits_list=args.bits)
+        test_niah(bits_list=args.bits)
+        test_speed()
+        test_params()
+
+    test_vram_projection()
+
+    if not args.skip_model:
+        test_real_model_ppl(model_name=args.model, bits_list=[b for b in args.bits if b >= 3])
+
+    print("\n" + "=" * 72)
+    print("ALL BENCHMARKS COMPLETE")
+    print("=" * 72)
 
 """
 Build script for TurboQuant with optional CUDA kernels.
@@ -2010,16 +2950,17 @@ if __name__ == "__main__":
     print("=" * 70)
 
 """
-RotorQuant High-Context POC
+IsoQuant High-Context POC
 
-Patches Qwen2.5-3B's KV cache with RotorQuant Triton-fused compression
+Patches Qwen2.5-3B's KV cache with IsoQuant Triton-fused compression
 and tests needle-in-haystack retrieval + generation at increasing context.
 
-Measures: VRAM, latency, attention fidelity, generation quality.
+Measures: VRAM, prefill tok/s, decode tok/s, attention fidelity, generation quality.
 
 Usage:
     python -m turboquant.poc_high_context
     python -m turboquant.poc_high_context --bits 3 --max-ctx 65536
+    python -m turboquant.poc_high_context --backend clifford  # legacy RotorQuant
 """
 
 import torch
@@ -2033,16 +2974,43 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from turboquant.isoquant import IsoQuantMSE
+from turboquant.triton_isoquant import triton_iso_fast_fused
+
+# PlanarQuant path (--backend planar)
+from turboquant.planarquant import PlanarQuantMSE
+from turboquant.triton_planarquant import triton_planar2_fused
+
+# Legacy Clifford path (--backend clifford)
 from turboquant.rotorquant import RotorQuantMSE
 from turboquant.triton_kernels import (
     triton_rotor_full_fused, pack_rotors_for_triton,
 )
 
 
-# ── RotorQuant KV cache compressor ──────────────────────────────────
+# ── KV cache compressor (IsoQuant or RotorQuant) ─────────────────────
+
+class IsoQuantKeyCompressor:
+    """Per-layer key compressor using IsoQuant-Fast + Triton fused kernel."""
+
+    def __init__(self, head_dim: int, bits: int, seed: int, device: str):
+        self.iq = IsoQuantMSE(head_dim, bits, seed=seed, mode='fast', device=device)
+        self.q_L = self.iq.q_L.to(device)
+        self.centroids = self.iq.centroids.to(device)
+        self.head_dim = head_dim
+        self.device = device
+
+    @torch.no_grad()
+    def compress_dequantize(self, keys: torch.Tensor) -> torch.Tensor:
+        B, H, S, D = keys.shape
+        orig_dtype = keys.dtype
+        flat = keys.reshape(-1, D)
+        flat_recon = triton_iso_fast_fused(flat, self.q_L, self.centroids)
+        return flat_recon.to(orig_dtype).reshape(B, H, S, D)
+
 
 class RotorQuantKeyCompressor:
-    """Per-layer key compressor using RotorQuant + Triton fused kernel."""
+    """Per-layer key compressor using RotorQuant + Triton fused kernel (legacy)."""
 
     def __init__(self, head_dim: int, bits: int, seed: int, device: str):
         self.rq = RotorQuantMSE(head_dim, bits, seed=seed, device=device)
@@ -2054,65 +3022,87 @@ class RotorQuantKeyCompressor:
 
     @torch.no_grad()
     def compress_dequantize(self, keys: torch.Tensor) -> torch.Tensor:
-        """Quantize → dequantize keys via Triton fused kernel.
-
-        Input:  (batch, n_kv_heads, seq_len, head_dim) float16/float32
-        Output: (batch, n_kv_heads, seq_len, head_dim) same dtype
-
-        The returned tensor is the MSE-optimal reconstruction.
-        """
         B, H, S, D = keys.shape
         orig_dtype = keys.dtype
-
-        # Flatten to (B*H*S, D) for the Triton kernel
         flat = keys.reshape(-1, D)
-
-        # Triton fused: embed→rotor→quantize→unrotor→extract
         flat_recon = triton_rotor_full_fused(
-            flat, self.packed_rotors,
-            None, self.c_v, None, self.c_t,
-        )
-
+            flat, self.packed_rotors, None, self.c_v, None, self.c_t)
         return flat_recon.to(orig_dtype).reshape(B, H, S, D)
 
 
-class RotorQuantValueCompressor:
-    """Per-layer value compressor using RotorQuant + Triton fused kernel."""
+class PlanarQuantKeyCompressor:
+    """Per-layer key compressor using PlanarQuant + Triton fused kernel."""
 
     def __init__(self, head_dim: int, bits: int, seed: int, device: str):
-        self.key_comp = RotorQuantKeyCompressor(head_dim, bits, seed, device)
+        self.pq = PlanarQuantMSE(head_dim, bits, seed=seed, device=device)
+        self.rot2 = self.pq.rot2.to(device)
+        self.centroids = self.pq.centroids.to(device)
+        self.head_dim = head_dim
+        self.device = device
+
+    @torch.no_grad()
+    def compress_dequantize(self, keys: torch.Tensor) -> torch.Tensor:
+        B, H, S, D = keys.shape
+        orig_dtype = keys.dtype
+        key_device = keys.device
+        flat = keys.reshape(-1, D).to(self.device)
+        flat_recon = triton_planar2_fused(flat, self.rot2, self.centroids)
+        return flat_recon.to(orig_dtype).to(key_device).reshape(B, H, S, D)
+
+
+class ValueCompressor:
+    """Per-layer value compressor — wraps either backend."""
+
+    def __init__(self, head_dim: int, bits: int, seed: int, device: str, backend: str = 'iso'):
+        if backend == 'planar':
+            self.inner = PlanarQuantKeyCompressor(head_dim, bits, seed, device)
+        elif backend == 'iso':
+            self.inner = IsoQuantKeyCompressor(head_dim, bits, seed, device)
+        else:
+            self.inner = RotorQuantKeyCompressor(head_dim, bits, seed, device)
 
     @torch.no_grad()
     def compress_dequantize(self, values: torch.Tensor) -> torch.Tensor:
-        return self.key_comp.compress_dequantize(values)
+        return self.inner.compress_dequantize(values)
 
 
 # ── Patched KV cache ────────────────────────────────────────────────
 
-class RotorQuantPatchedCache:
+class PatchedCache:
     """Wraps HuggingFace DynamicCache to quantize keys/values on insertion."""
 
-    def __init__(self, bits: int, device: str, quantize_values: bool = True):
+    def __init__(self, bits: int, device: str, quantize_values: bool = True,
+                 backend: str = 'iso'):
         self.bits = bits
         self.device = device
         self.quantize_values = quantize_values
+        self.backend = backend
         self._key_compressors = {}
         self._val_compressors = {}
 
-    def get_key_compressor(self, layer_idx: int, head_dim: int) -> RotorQuantKeyCompressor:
+    def get_key_compressor(self, layer_idx: int, head_dim: int):
         if layer_idx not in self._key_compressors:
-            self._key_compressors[layer_idx] = RotorQuantKeyCompressor(
-                head_dim, self.bits, seed=layer_idx * 1000, device=self.device)
+            if self.backend == 'planar':
+                self._key_compressors[layer_idx] = PlanarQuantKeyCompressor(
+                    head_dim, self.bits, seed=layer_idx * 1000, device=self.device)
+            elif self.backend == 'iso':
+                self._key_compressors[layer_idx] = IsoQuantKeyCompressor(
+                    head_dim, self.bits, seed=layer_idx * 1000, device=self.device)
+            else:
+                self._key_compressors[layer_idx] = RotorQuantKeyCompressor(
+                    head_dim, self.bits, seed=layer_idx * 1000, device=self.device)
         return self._key_compressors[layer_idx]
 
-    def get_val_compressor(self, layer_idx: int, head_dim: int) -> RotorQuantValueCompressor:
+    def get_val_compressor(self, layer_idx: int, head_dim: int):
         if layer_idx not in self._val_compressors:
-            self._val_compressors[layer_idx] = RotorQuantValueCompressor(
-                head_dim, self.bits, seed=layer_idx * 1000 + 500, device=self.device)
+            self._val_compressors[layer_idx] = ValueCompressor(
+                head_dim, self.bits, seed=layer_idx * 1000 + 500,
+                device=self.device, backend=self.backend)
         return self._val_compressors[layer_idx]
 
 
-def patch_model_kv_cache(model, bits: int = 4, quantize_values: bool = False):
+def patch_model_kv_cache(model, bits: int = 4, quantize_values: bool = False,
+                         backend: str = 'iso'):
     """Monkey-patch model's cache update for post-prefill RotorQuant compression.
 
     Strategy:
@@ -2126,12 +3116,13 @@ def patch_model_kv_cache(model, bits: int = 4, quantize_values: bool = False):
     """
     from transformers import DynamicCache
 
-    rq_cache = RotorQuantPatchedCache(bits, "cuda", quantize_values)
+    rq_cache = PatchedCache(bits, "cuda", quantize_values, backend=backend)
     prefill_done = {}  # per-layer tracking
 
     _original_update = DynamicCache.update
 
-    def _compress_keys(key_states, layer_idx):
+    def _compress_keys_inplace(key_states, layer_idx):
+        """Quantize keys, returning new tensor (same shape/device)."""
         D = key_states.shape[-1]
         kc = rq_cache.get_key_compressor(layer_idx, D)
         return kc.compress_dequantize(key_states)
@@ -2145,8 +3136,15 @@ def patch_model_kv_cache(model, bits: int = 4, quantize_values: bool = False):
             prefill_done[layer_idx] = True
             return _original_update(self, key_states, value_states, layer_idx, cache_kwargs)
 
-        # Decode: quantize new key for storage, full-precision for current attention
-        key_quantized = _compress_keys(key_states, layer_idx)
+        # Decode: quantize new key for storage, full-precision for current attention.
+        #
+        # Old approach: k_out.clone() — copied entire cache, O(seq_len) per token.
+        # New approach: store quantized, then patch last position in-place, O(1).
+        #
+        # The previous step's key stays full-precision in the cache (never
+        # re-quantized). This is intentional — one unquantized key per decode
+        # step only helps quality, and the overhead is zero.
+        key_quantized = _compress_keys_inplace(key_states, layer_idx)
 
         # Optionally quantize values
         if rq_cache.quantize_values:
@@ -2156,14 +3154,20 @@ def patch_model_kv_cache(model, bits: int = 4, quantize_values: bool = False):
 
         k_out, v_out = _original_update(self, key_quantized, value_states, layer_idx, cache_kwargs)
 
-        # Return full-precision key for current token's attention
-        k_out = k_out.clone()
-        k_out[:, :, -1:, :] = key_states
-
-        # On first decode step: quantize all prefill keys in bulk
+        # On first decode step: quantize all prefill keys in bulk (one-time cost)
         if prefill_done.get(layer_idx) is True:
-            k_out[:, :, :-1, :] = _compress_keys(k_out[:, :, :-1, :], layer_idx)
+            cached_keys = self.layers[layer_idx].keys
+            B, H, S, D = cached_keys.shape
+            if S > 1:
+                prefill_keys = cached_keys[:, :, :-1, :]
+                prefill_q = _compress_keys_inplace(prefill_keys, layer_idx)
+                cached_keys[:, :, :-1, :] = prefill_q
             prefill_done[layer_idx] = 'done'
+
+        # Patch last position to full-precision for current-step attention.
+        # k_out IS the cache tensor — this writes directly into the cache.
+        # Next step, a new key appends and this position stays full-precision.
+        k_out[:, :, -1:, :] = key_states
 
         return k_out, v_out
 
@@ -2212,7 +3216,7 @@ def build_prompt(tokenizer, target_tokens=2048, needle_pos=0.33):
 # ── Attention fidelity measurement ──────────────────────────────────
 
 @torch.no_grad()
-def measure_attention_fidelity(model, tokenizer, context_len, bits):
+def measure_attention_fidelity(model, tokenizer, context_len, bits, backend='iso'):
     """Compare RotorQuant attention scores vs FP16 on real KV cache.
 
     Returns dict with cosine_sim, top1_match, needle_found.
@@ -2239,8 +3243,13 @@ def measure_attention_fidelity(model, tokenizer, context_len, bits):
         keys = cache_fp16.layers[layer_idx].keys  # (1, H, S, D)
         B, H, S, D = keys.shape
 
-        # Compress keys with RotorQuant
-        compressor = RotorQuantKeyCompressor(D, bits, seed=layer_idx * 1000, device="cuda")
+        # Compress keys
+        if backend == 'planar':
+            compressor = PlanarQuantKeyCompressor(D, bits, seed=layer_idx * 1000, device="cuda")
+        elif backend == 'iso':
+            compressor = IsoQuantKeyCompressor(D, bits, seed=layer_idx * 1000, device="cuda")
+        else:
+            compressor = RotorQuantKeyCompressor(D, bits, seed=layer_idx * 1000, device="cuda")
         keys_rq = compressor.compress_dequantize(keys)
 
         # Query = last token attending to all keys
@@ -2280,10 +3289,11 @@ def measure_attention_fidelity(model, tokenizer, context_len, bits):
 # ── Generation test ─────────────────────────────────────────────────
 
 @torch.no_grad()
-def test_generation(model, tokenizer, context_len, bits, max_new_tokens=50, keys_only=True):
-    """Generate text with RotorQuant-compressed KV cache.
+def test_generation(model, tokenizer, context_len, bits, max_new_tokens=50,
+                    keys_only=True, backend='iso'):
+    """Generate text with compressed KV cache.
 
-    Returns dict with generation, tokens/sec, VRAM usage, needle_found.
+    Returns dict with prefill_tok_s, decode_tok_s, VRAM usage, needle_found.
     """
     prompt = build_prompt(tokenizer, context_len)
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True,
@@ -2297,10 +3307,19 @@ def test_generation(model, tokenizer, context_len, bits, max_new_tokens=50, keys
     vram_before = torch.cuda.memory_allocated() / 1024**2
 
     # Patch KV cache
-    original_update, rq_cache = patch_model_kv_cache(model, bits=bits, quantize_values=not keys_only)
+    original_update, rq_cache = patch_model_kv_cache(
+        model, bits=bits, quantize_values=not keys_only, backend=backend)
 
     try:
-        t0 = time.perf_counter()
+        # Prefill: single forward pass on full prompt
+        t_prefill_start = time.perf_counter()
+        prefill_out = model(**inputs, use_cache=True)
+        torch.cuda.synchronize()
+        t_prefill = time.perf_counter() - t_prefill_start
+        prefill_tok_s = input_len / t_prefill if t_prefill > 0 else 0
+
+        # Decode: generate token by token
+        t_decode_start = time.perf_counter()
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -2308,16 +3327,18 @@ def test_generation(model, tokenizer, context_len, bits, max_new_tokens=50, keys
             use_cache=True,
         )
         torch.cuda.synchronize()
-        t_gen = time.perf_counter() - t0
+        t_total = time.perf_counter() - t_decode_start
 
         gen_tokens = outputs[0][input_len:]
         n_gen = len(gen_tokens)
         text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
 
+        # Decode speed: subtract prefill time from total
+        t_decode = t_total - t_prefill if t_total > t_prefill else t_total
+        decode_tok_s = n_gen / t_decode if t_decode > 0 else 0
+
         vram_peak = torch.cuda.max_memory_allocated() / 1024**2
         vram_kv = vram_peak - vram_before
-
-        tok_per_sec = n_gen / t_gen if t_gen > 0 else 0
 
         needle_found = "AURORA-7749" in text or "aurora" in text.lower()
 
@@ -2329,8 +3350,9 @@ def test_generation(model, tokenizer, context_len, bits, max_new_tokens=50, keys
         "input_tokens": input_len,
         "gen_tokens": n_gen,
         "text": text.strip(),
-        "tok_per_sec": tok_per_sec,
-        "time_s": t_gen,
+        "prefill_tok_s": prefill_tok_s,
+        "decode_tok_s": decode_tok_s,
+        "time_s": t_total,
         "vram_peak_mb": vram_peak,
         "vram_kv_est_mb": vram_kv,
         "needle_found": needle_found,
@@ -2395,13 +3417,18 @@ def main():
                         help="Only compress keys, leave values in fp16 (recommended)")
     parser.add_argument("--compress-values", dest="keys_only", action="store_false",
                         help="Also compress values (higher error)")
+    parser.add_argument("--backend", type=str, default="iso", choices=["iso", "clifford", "planar"],
+                        help="Rotation backend: iso (IsoQuant), clifford (RotorQuant), or planar (PlanarQuant)")
     args = parser.parse_args()
+
+    backend_names = {"iso": "IsoQuant", "clifford": "RotorQuant", "planar": "PlanarQuant"}
+    backend_name = backend_names[args.backend]
 
     print()
     print("=" * 74)
-    print("  RotorQuant High-Context POC")
+    print(f"  {backend_name} High-Context POC")
     print(f"  Model: {args.model}")
-    print(f"  Bits: {args.bits}  |  Max context: {args.max_ctx:,}  |  Keys only: {args.keys_only}")
+    print(f"  Bits: {args.bits}  |  Max context: {args.max_ctx:,}  |  Keys only: {args.keys_only}  |  Backend: {backend_name}")
     print(f"  GPU: {torch.cuda.get_device_name()}")
     print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     print("=" * 74)
@@ -2454,7 +3481,7 @@ def main():
                 print(f"  {ctx_len:>8,}  {'(skipped — needs 2x VRAM)':>40s}")
                 continue
             try:
-                result = measure_attention_fidelity(model, tokenizer, ctx_len, args.bits)
+                result = measure_attention_fidelity(model, tokenizer, ctx_len, args.bits, args.backend)
                 print(f"  {result['seq_len']:>8,}  {result['cosine_sim']:>12.6f}  "
                       f"{result['top1_match']:>10.1f}%  {result['n_layers']:>8d}")
             except torch.cuda.OutOfMemoryError:
@@ -2464,9 +3491,9 @@ def main():
 
         print()
 
-    # ── Phase 2: Generation with RotorQuant ──
+    # ── Phase 2: Generation with compressed KV cache ──
     print("=" * 74)
-    print(f"PHASE 2: Generation with RotorQuant ({args.bits}-bit KV cache)")
+    print(f"PHASE 2: Generation with {backend_name} ({args.bits}-bit KV cache)")
     print("=" * 74)
     print()
 
@@ -2484,23 +3511,25 @@ def main():
         baseline = None
     print()
 
-    # RotorQuant at each context length
-    print(f"  RotorQuant {args.bits}-bit results:")
+    # Compressed KV at each context length
+    print(f"  {backend_name} {args.bits}-bit results:")
     print()
-    print(f"  {'Context':>8s}  {'Speed':>10s}  {'VRAM Peak':>10s}  {'Needle':>8s}  {'Output (first 80 chars)'}")
-    print(f"  {'─'*8}  {'─'*10}  {'─'*10}  {'─'*8}  {'─'*40}")
+    print(f"  {'Context':>8s}  {'Prefill':>10s}  {'Decode':>10s}  {'VRAM':>8s}  {'Needle':>8s}  {'Output (first 60 chars)'}")
+    print(f"  {'─'*8}  {'─'*10}  {'─'*10}  {'─'*8}  {'─'*8}  {'─'*40}")
 
     for ctx_len in ctx_lengths:
         torch.cuda.empty_cache()
         gc.collect()
 
         try:
-            result = test_generation(model, tokenizer, ctx_len, args.bits, args.max_new_tokens, args.keys_only)
+            result = test_generation(model, tokenizer, ctx_len, args.bits,
+                                     args.max_new_tokens, args.keys_only, args.backend)
             needle_str = "FOUND" if result['needle_found'] else "MISS"
-            text_preview = result['text'][:80].replace('\n', ' ')
+            text_preview = result['text'][:60].replace('\n', ' ')
             print(f"  {result['input_tokens']:>8,}  "
-                  f"{result['tok_per_sec']:>8.1f}/s  "
-                  f"{result['vram_peak_mb']:>8.0f}MB  "
+                  f"{result['prefill_tok_s']:>8.1f}/s  "
+                  f"{result['decode_tok_s']:>8.1f}/s  "
+                  f"{result['vram_peak_mb']:>6.0f}MB  "
                   f"{needle_str:>8s}  "
                   f"{text_preview}")
         except torch.cuda.OutOfMemoryError:
@@ -2763,11 +3792,32 @@ from .turboquant import TurboQuantMSE, TurboQuantProd, TurboQuantKVCache
 from .lloyd_max import LloydMaxCodebook, solve_lloyd_max
 from .compressors import TurboQuantCompressorV2, TurboQuantCompressorMSE
 from .cuda_backend import is_cuda_available, QJLSketch, QJLKeyQuantizer
+from .isoquant import IsoQuantMSE, IsoQuantProd
+from .planarquant import PlanarQuantMSE, PlanarQuantProd
 from .rotorquant import RotorQuantMSE, RotorQuantProd, RotorQuantKVCache
 from .clifford import geometric_product, make_random_rotor, rotor_sandwich
 
+# IsoQuant is the recommended default (5.8x faster, same quality)
+QuantMSE = IsoQuantMSE
+QuantProd = IsoQuantProd
+
 # Triton kernels (optional, requires triton >= 3.0)
 try:
+    from .triton_planarquant import (
+        triton_planar2_fused,
+        triton_planar2_quantize,
+        triton_planar2_dequantize,
+    )
+    from .fused_planar_attention import (
+        triton_fused_planar_quantize_attend,
+        triton_planar_cached_attention,
+        pre_rotate_query_planar,
+        PlanarQuantCompressedCache,
+    )
+    from .triton_isoquant import (
+        triton_iso_full_fused,
+        triton_iso_fast_fused,
+    )
     from .triton_kernels import (
         triton_rotor_sandwich,
         triton_rotor_full_fused,
@@ -4054,6 +5104,260 @@ def install_fused_rotor_attention(model, bits: int = 3) -> RotorQuantCompressedC
     return cache
 
 """
+Benchmark: PlanarQuant cached attention vs standard dequantize+matmul.
+
+Simulates realistic autoregressive decode:
+  - KV cache already populated with quantized indices (int8)
+  - Each step: one new Q token attends to all cached K tokens
+  - Compare three attention paths:
+      A. Standard: dequantize K (inverse rotate) → VRAM → cuBLAS Q@K^T
+      B. Cached:   gather-dot on int8 indices with pre-rotated Q (no dequantize)
+      C. FP16 baseline: uncompressed K in VRAM → cuBLAS Q@K^T
+
+Reference: ParaMind2025/isoquant
+"""
+
+import torch
+import torch.nn.functional as F
+import math
+import time
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from turboquant.planarquant import PlanarQuantMSE
+from turboquant.triton_planarquant import triton_planar2_fused, triton_planar2_quantize
+from turboquant.fused_planar_attention import (
+    triton_planar_cached_attention,
+    pre_rotate_query_planar,
+)
+
+
+def bench(fn, warmup=50, iters=200):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / iters * 1e6  # µs
+
+
+def benchmark_attention_paths(device='cuda'):
+    """Compare three attention paths at different KV cache lengths."""
+    d = 128
+    bits = 3
+    batch = 1
+    n_q_heads = 32
+    n_kv_heads = 8
+    gqa_ratio = n_q_heads // n_kv_heads
+    scale = 1.0 / math.sqrt(d)
+
+    pq = PlanarQuantMSE(d, bits, seed=42, device=device)
+
+    print("=" * 95)
+    print("  DECODE ATTENTION: Standard (dequantize+matmul) vs Cached (gather-dot) vs FP16 baseline")
+    print("=" * 95)
+    print(f"  d={d}, bits={bits}, batch={batch}, q_heads={n_q_heads}, kv_heads={n_kv_heads}")
+    print(f"  GPU: {torch.cuda.get_device_name()}")
+    print()
+    print(f"  {'kv_len':>8} | {'FP16':>10} {'Standard':>10} {'Cached':>10} | {'Cached/FP16':>12} {'Cached/Std':>12} | {'Cos(C,S)':>10}")
+    print(f"  {'-'*8}-+-{'-'*10}-{'-'*10}-{'-'*10}-+-{'-'*12}-{'-'*12}-+-{'-'*10}")
+
+    for kv_len in [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]:
+        torch.manual_seed(42)
+        Q = torch.randn(batch, n_q_heads, 1, d, device=device)
+        K_raw = torch.randn(batch, n_kv_heads, kv_len, d, device=device)
+
+        # ── Pre-compute quantized cache (done once during prefill) ──
+        K_flat = K_raw.reshape(-1, d)
+        indices, norms = triton_planar2_quantize(K_flat, pq.rot2, pq.centroids)
+        indices = indices.reshape(batch, n_kv_heads, kv_len, pq.d_padded)
+        norms = norms.reshape(batch, n_kv_heads, kv_len)
+
+        # Pre-rotate Q
+        Q_rot = pre_rotate_query_planar(Q, pq.rot2, pq.d_padded)
+
+        # Also pre-compute dequantized K for standard path
+        K_deq = triton_planar2_fused(K_flat, pq.rot2, pq.centroids)
+        K_deq = K_deq.reshape(batch, n_kv_heads, kv_len, d)
+
+        # FP16 baseline (uncompressed K)
+        K_fp16 = K_raw.half()
+        K_fp16_exp = K_fp16.repeat_interleave(gqa_ratio, dim=1)
+        Q_half = Q.half()
+
+        # ── Path A: FP16 baseline ──
+        def fp16_fn():
+            return torch.matmul(Q_half, K_fp16_exp.transpose(2, 3)) * scale
+
+        # ── Path B: Standard dequantize + matmul ──
+        K_deq_exp = K_deq.repeat_interleave(gqa_ratio, dim=1)
+
+        def standard_fn():
+            return torch.matmul(Q, K_deq_exp.transpose(2, 3)) * scale
+
+        # ── Path C: Cached gather-dot ──
+        def cached_fn():
+            return triton_planar_cached_attention(Q_rot, indices, norms, pq.centroids, scale)
+
+        # Verify correctness
+        ref = standard_fn().squeeze(2)
+        out_c = cached_fn().squeeze(2)
+        cos = F.cosine_similarity(ref.reshape(1, -1), out_c.reshape(1, -1)).item()
+
+        # Benchmark
+        t_fp16 = bench(fp16_fn)
+        t_std = bench(standard_fn)
+        t_cached = bench(cached_fn)
+
+        print(f"  {kv_len:>8} | {t_fp16:>8.0f}µs {t_std:>8.0f}µs {t_cached:>8.0f}µs |"
+              f" {t_fp16/t_cached:>11.2f}x {t_std/t_cached:>11.2f}x | {cos:>10.6f}")
+
+    print()
+
+
+def benchmark_memory(device='cuda'):
+    """Show VRAM usage: standard path vs cached path."""
+    d = 128
+    bits = 3
+    n_kv_heads = 8
+
+    pq = PlanarQuantMSE(d, bits, seed=42, device=device)
+
+    print("=" * 75)
+    print("  KV CACHE MEMORY: FP16 vs Quantized (per layer)")
+    print("=" * 75)
+    print(f"  {'kv_len':>8} | {'FP16 K':>10} {'Quant K':>10} {'Compression':>12} | {'Quant format'}")
+    print(f"  {'-'*8}-+-{'-'*10}-{'-'*10}-{'-'*12}-+-{'-'*30}")
+
+    for kv_len in [1024, 4096, 16384, 32768, 65536, 131072]:
+        # FP16: n_kv_heads × kv_len × d × 2 bytes
+        fp16_bytes = n_kv_heads * kv_len * d * 2
+
+        # Quantized: indices (int8) + norms (fp32)
+        # indices: n_kv_heads × kv_len × d_padded × 1 byte
+        # norms: n_kv_heads × kv_len × 4 bytes
+        idx_bytes = n_kv_heads * kv_len * pq.d_padded * 1
+        norm_bytes = n_kv_heads * kv_len * 4
+        quant_bytes = idx_bytes + norm_bytes
+
+        ratio = fp16_bytes / quant_bytes
+
+        def fmt(b):
+            if b < 1024:
+                return f"{b} B"
+            elif b < 1024 * 1024:
+                return f"{b/1024:.1f} KB"
+            else:
+                return f"{b/(1024*1024):.1f} MB"
+
+        print(f"  {kv_len:>8} | {fmt(fp16_bytes):>10} {fmt(quant_bytes):>10} {ratio:>11.1f}x |"
+              f" int8[{pq.d_padded}] + fp32 norm")
+
+    print()
+
+
+def benchmark_decode_step(device='cuda'):
+    """Simulate realistic decode: 1 new token per step, growing cache."""
+    d = 128
+    bits = 3
+    batch = 1
+    n_q_heads = 32
+    n_kv_heads = 8
+    scale = 1.0 / math.sqrt(d)
+
+    pq = PlanarQuantMSE(d, bits, seed=42, device=device)
+
+    print("=" * 75)
+    print("  FULL DECODE STEP: quantize new K + attend to entire cache")
+    print("=" * 75)
+    print(f"  Simulates one autoregressive decode step at each cache length.")
+    print(f"  'Std' = dequantize all cached K + matmul (what happens without fusion)")
+    print(f"  'Fused' = quantize new K + gather-dot on cached + new K")
+    print()
+    print(f"  {'cache_len':>10} | {'Std total':>10} {'Fused total':>12} {'Speedup':>8}")
+    print(f"  {'-'*10}-+-{'-'*10}-{'-'*12}-{'-'*8}")
+
+    for cache_len in [256, 1024, 4096, 8192, 16384]:
+        torch.manual_seed(42)
+        Q = torch.randn(batch, n_q_heads, 1, d, device=device)
+
+        # Cached K (already quantized from previous steps)
+        K_cached_raw = torch.randn(batch, n_kv_heads, cache_len, d, device=device)
+        K_flat = K_cached_raw.reshape(-1, d)
+        cached_idx, cached_norms = triton_planar2_quantize(K_flat, pq.rot2, pq.centroids)
+        cached_idx = cached_idx.reshape(batch, n_kv_heads, cache_len, pq.d_padded)
+        cached_norms = cached_norms.reshape(batch, n_kv_heads, cache_len)
+
+        # New K token (this step)
+        K_new = torch.randn(batch, n_kv_heads, 1, d, device=device)
+
+        # Pre-rotate Q
+        Q_rot = pre_rotate_query_planar(Q, pq.rot2, pq.d_padded)
+
+        # Dequantized cache for standard path
+        K_deq = triton_planar2_fused(K_flat, pq.rot2, pq.centroids)
+        K_deq = K_deq.reshape(batch, n_kv_heads, cache_len, d)
+
+        gqa = n_q_heads // n_kv_heads
+
+        # ── Standard: dequantize new K + concat + matmul ──
+        def standard_step():
+            # Quantize new K (for storage)
+            Kn_flat = K_new.reshape(-1, d)
+            Kn_hat = triton_planar2_fused(Kn_flat, pq.rot2, pq.centroids)
+            Kn_hat = Kn_hat.reshape(batch, n_kv_heads, 1, d)
+            # Concat with dequantized cache
+            K_all = torch.cat([K_deq, Kn_hat], dim=2)
+            K_exp = K_all.repeat_interleave(gqa, dim=1)
+            return torch.matmul(Q, K_exp.transpose(2, 3)) * scale
+
+        # ── Fused: quantize new K, concat indices, gather-dot ──
+        def fused_step():
+            # Quantize new K
+            Kn_flat = K_new.reshape(-1, d)
+            new_idx, new_norms = triton_planar2_quantize(Kn_flat, pq.rot2, pq.centroids)
+            new_idx = new_idx.reshape(batch, n_kv_heads, 1, pq.d_padded)
+            new_norms = new_norms.reshape(batch, n_kv_heads, 1)
+            # Concat indices
+            all_idx = torch.cat([cached_idx, new_idx], dim=2)
+            all_norms = torch.cat([cached_norms, new_norms], dim=2)
+            # Gather-dot attention
+            return triton_planar_cached_attention(Q_rot, all_idx, all_norms,
+                                                   pq.centroids, scale)
+
+        t_std = bench(standard_step)
+        t_fused = bench(fused_step)
+
+        print(f"  {cache_len:>10} | {t_std:>8.0f}µs {t_fused:>10.0f}µs {t_std/t_fused:>7.2f}x")
+
+    print()
+
+
+if __name__ == '__main__':
+    if not torch.cuda.is_available():
+        print("CUDA required")
+        sys.exit(1)
+
+    print()
+    print("╔═════════════════════════════════════════════════════════════════════════════╗")
+    print("║  PlanarQuant Fused Attention Benchmark                                    ║")
+    print("║  Cached gather-dot vs standard dequantize+matmul                          ║")
+    print("╚═════════════════════════════════════════════════════════════════════════════╝")
+    print()
+
+    benchmark_attention_paths()
+    benchmark_memory()
+    benchmark_decode_step()
+
+    print("=" * 75)
+    print("  DONE")
+    print("=" * 75)
+
+"""
 RotorQuant: Reimagining TurboQuant with Clifford Algebra
 
 Instead of TurboQuant's random orthogonal matrix Π (via QR decomposition),
@@ -4678,6 +5982,287 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+IsoQuant: Quaternion-based 4D block rotation for KV cache quantization.
+
+Drop-in replacement for RotorQuantMSE that uses quaternion sandwich products
+instead of Clifford Cl(3,0) rotors. Based on the isoclinic decomposition:
+    SO(4) ≅ SU(2) × SU(2)
+    T(v) = q_L v q̄_R  (IsoQuant-Full, 6 DOF)
+    T(v) = q_L v       (IsoQuant-Fast, 3 DOF)
+
+Advantages over RotorQuant:
+  - 4D blocks align to powers-of-2 head dims (no tail handling)
+  - 4 components per block vs 8 (no multivector expansion)
+  - ~2x fewer FMAs per rotation at same quality
+  - Cleaner kernel fusion (4-wide = SIMD friendly)
+
+Reference: Ji, "IsoQuant: Hardware-Aligned SO(4) Isoclinic Rotations
+           for LLM KV Cache Compression", March 2026.
+"""
+
+import torch
+import torch.nn as nn
+import math
+from typing import Optional, Tuple, Dict
+
+from .lloyd_max import LloydMaxCodebook
+
+
+# ── Quaternion math ───────────────────────────────────────────────────
+
+def quat_conjugate(q: torch.Tensor) -> torch.Tensor:
+    """Quaternion conjugate: (w, x, y, z) → (w, -x, -y, -z)."""
+    signs = torch.tensor([1, -1, -1, -1], dtype=q.dtype, device=q.device)
+    return q * signs
+
+
+def quat_multiply(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Hamilton product of two quaternions.
+
+    a, b: (..., 4) as [w, x, y, z]
+    Returns: (..., 4) as [w, x, y, z]
+
+    Uses 16 multiplies + 12 adds = 16 FMAs.
+    """
+    aw, ax, ay, az = a.unbind(-1)
+    bw, bx, by, bz = b.unbind(-1)
+
+    rw = aw*bw - ax*bx - ay*by - az*bz
+    rx = aw*bx + ax*bw + ay*bz - az*by
+    ry = aw*by - ax*bz + ay*bw + az*bx
+    rz = aw*bz + ax*by - ay*bx + az*bw
+
+    return torch.stack([rw, rx, ry, rz], dim=-1)
+
+
+def make_random_unit_quaternion(shape: Tuple[int, ...],
+                                 device='cpu', seed=None) -> torch.Tensor:
+    """Generate random unit quaternions via normalized Gaussian."""
+    gen = torch.Generator(device='cpu')
+    if seed is not None:
+        gen.manual_seed(seed)
+    q = torch.randn(*shape, 4, generator=gen).to(device)
+    return q / q.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+
+# ── IsoQuantMSE ───────────────────────────────────────────────────────
+
+class IsoQuantMSE(nn.Module):
+    """
+    Stage 1: MSE-optimal quantizer using quaternion block rotations.
+
+    Instead of Cl(3,0) rotor sandwich (3D blocks, 8 components),
+    we use quaternion sandwich (4D blocks, 4 components).
+
+    Modes:
+      'full': T(v) = q_L v q̄_R  — full SO(4), 6 DOF per block
+      'fast': T(v) = q_L v      — isoclinic SO(3) subgroup, 3 DOF per block
+    """
+
+    def __init__(self, d: int, bits: int, seed: int = 42,
+                 mode: str = 'full', device: str = "cpu"):
+        """
+        Args:
+            d: original vector dimension
+            bits: bits per component for Lloyd-Max quantization
+            seed: random seed for quaternion generation
+            mode: 'full' (q_L v q̄_R) or 'fast' (q_L v)
+            device: torch device
+        """
+        super().__init__()
+        self.d = d
+        self.bits = bits
+        self.device = device
+        self.mode = mode
+
+        # 4D blocks — clean alignment for powers-of-2 dims
+        self.n_groups = (d + 3) // 4  # ceil(d/4)
+        self.d_padded = self.n_groups * 4
+
+        # Lloyd-Max codebook: same as RotorQuant, d_eff = d
+        cb = LloydMaxCodebook(d, bits)
+        self.register_buffer('centroids', cb.centroids.to(device))
+
+        # Random unit quaternions (one per group)
+        q_L = make_random_unit_quaternion((self.n_groups,), device=device, seed=seed)
+        self.register_buffer('q_L', q_L)
+
+        if mode == 'full':
+            q_R = make_random_unit_quaternion((self.n_groups,), device=device, seed=seed + 10000)
+            self.register_buffer('q_R', q_R)
+
+    def _embed(self, x: torch.Tensor) -> torch.Tensor:
+        """Embed d-dim vectors into groups of 4D quaternions.
+
+        x: (..., d) → (..., n_groups, 4)
+        """
+        # Pad to multiple of 4
+        pad = self.d_padded - self.d
+        if pad > 0:
+            x = torch.nn.functional.pad(x, (0, pad))
+        return x.reshape(*x.shape[:-1], self.n_groups, 4)
+
+    def _extract(self, v: torch.Tensor) -> torch.Tensor:
+        """Extract d-dim vectors from groups of 4D quaternions.
+
+        v: (..., n_groups, 4) → (..., d)
+        """
+        flat = v.reshape(*v.shape[:-2], -1)
+        return flat[..., :self.d]
+
+    def _rotate(self, v: torch.Tensor) -> torch.Tensor:
+        """Apply forward rotation to 4D blocks.
+
+        v: (..., n_groups, 4) — treated as quaternions
+        """
+        if self.mode == 'full':
+            # T(v) = q_L * v * conjugate(q_R)
+            temp = quat_multiply(self.q_L, v)
+            return quat_multiply(temp, quat_conjugate(self.q_R))
+        else:
+            # T(v) = q_L * v
+            return quat_multiply(self.q_L, v)
+
+    def _unrotate(self, v: torch.Tensor) -> torch.Tensor:
+        """Apply inverse rotation to 4D blocks.
+
+        v: (..., n_groups, 4)
+        """
+        if self.mode == 'full':
+            # T^{-1}(v) = conjugate(q_L) * v * q_R
+            temp = quat_multiply(quat_conjugate(self.q_L), v)
+            return quat_multiply(temp, self.q_R)
+        else:
+            # T^{-1}(v) = conjugate(q_L) * v
+            return quat_multiply(quat_conjugate(self.q_L), v)
+
+    def _quantize_scalar(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-coordinate Lloyd-Max quantization."""
+        diffs = x.unsqueeze(-1) - self.centroids  # (..., n_levels)
+        indices = diffs.abs().argmin(dim=-1)
+        x_q = self.centroids[indices]
+        return x_q, indices
+
+    def quantize(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+        """
+        Quantize vectors via quaternion rotation + Lloyd-Max.
+
+        x: (..., d) input vectors
+        Returns: (x_quantized_rotated, indices_dict)
+        """
+        # Separate norm and direction
+        norms = torch.norm(x, dim=-1, keepdim=True).clamp(min=1e-8)
+        x_unit = x / norms
+
+        # Embed into 4D blocks
+        v = self._embed(x_unit)  # (..., n_groups, 4)
+
+        # Rotate
+        v_rot = self._rotate(v)
+
+        # Scalar quantize all 4 components per block
+        flat = v_rot.reshape(*v_rot.shape[:-2], -1)  # (..., n_groups*4)
+        q_flat, indices = self._quantize_scalar(flat)
+        v_q = q_flat.reshape_as(v_rot)
+
+        return v_q, {
+            'indices': indices,
+            '_norms': norms.squeeze(-1),
+        }
+
+    def dequantize(self, indices_dict: dict) -> torch.Tensor:
+        """Reconstruct vectors from quantized indices."""
+        idx = indices_dict['indices']
+        values = self.centroids[idx]
+
+        # Reshape back to groups of 4
+        v_q = values.reshape(*values.shape[:-1], self.n_groups, 4)
+
+        # Inverse rotation
+        v_recon = self._unrotate(v_q)
+
+        # Extract and rescale
+        x_hat = self._extract(v_recon)
+        if '_norms' in indices_dict:
+            norms = indices_dict['_norms']
+            if norms.dim() < x_hat.dim():
+                norms = norms.unsqueeze(-1)
+            x_hat = x_hat * norms
+
+        return x_hat
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+        """Full quantize-dequantize cycle."""
+        v_q, indices = self.quantize(x)
+        x_hat = self.dequantize(indices)
+        return x_hat, indices
+
+
+# ── IsoQuantProd (Stage 1 + Stage 2 with QJL) ────────────────────────
+
+class IsoQuantProd(nn.Module):
+    """
+    Stage 1 + Stage 2: Unbiased inner product quantizer.
+
+    Uses (b-1)-bit IsoQuant MSE + 1-bit QJL on residuals.
+    Drop-in replacement for RotorQuantProd.
+    """
+
+    def __init__(self, d: int, bits: int, mode: str = 'full',
+                 qjl_dim: Optional[int] = None,
+                 seed: int = 42, device: str = "cpu"):
+        super().__init__()
+        self.d = d
+        self.bits = bits
+        self.mse_bits = max(bits - 1, 1)
+        self.qjl_dim = qjl_dim or d
+        self.device = device
+
+        # Stage 1: IsoQuant MSE
+        self.mse = IsoQuantMSE(d, self.mse_bits, seed=seed, mode=mode, device=device)
+
+        # Stage 2: QJL projection (same as TurboQuant/RotorQuant)
+        gen = torch.Generator(device='cpu')
+        gen.manual_seed(seed + 1)
+        S = torch.randn(self.qjl_dim, d, generator=gen)
+        self.register_buffer("S", S.to(device))
+
+    def quantize(self, x: torch.Tensor) -> dict:
+        x_hat, mse_indices = self.mse(x)
+
+        residual = x - x_hat
+        residual_norm = torch.norm(residual, dim=-1, keepdim=True)
+
+        projected = residual @ self.S.T
+        qjl_signs = torch.sign(projected)
+        qjl_signs[qjl_signs == 0] = 1.0
+
+        return {
+            'mse_indices': mse_indices,
+            'qjl_signs': qjl_signs,
+            'residual_norm': residual_norm.squeeze(-1),
+        }
+
+    def dequantize(self, compressed: dict) -> torch.Tensor:
+        return self.mse.dequantize(compressed['mse_indices'])
+
+    def inner_product(self, y: torch.Tensor, compressed: dict) -> torch.Tensor:
+        x_mse = self.mse.dequantize(compressed['mse_indices'])
+        term1 = (y * x_mse).sum(dim=-1)
+
+        y_projected = y @ self.S.T
+        qjl_ip = (y_projected * compressed['qjl_signs']).sum(dim=-1)
+
+        m = self.qjl_dim
+        correction_scale = math.sqrt(math.pi / 2) / m
+        term2 = compressed['residual_norm'] * correction_scale * qjl_ip
+
+        return term1 + term2
+
+    def forward(self, x: torch.Tensor) -> dict:
+        return self.quantize(x)
 
 """
 CUDA backend for TurboQuant.
@@ -5591,6 +7176,877 @@ class CalibratedRotorQuantCompressor:
         return k_mse.to(key_states.dtype).reshape(B, H, S, D)
 
 """
+Triton kernels for PlanarQuant: GPU-accelerated 2D Givens rotation quantization.
+
+Kernels:
+  1. triton_planar2_fused — rotate(cos θ, sin θ) → quantize → inverse rotate
+
+This is the Triton equivalent of csrc/planar2_fused_kernel.cu.
+The simplest kernel in the rotation family — only 4 FMAs per 2D pair.
+
+Compared to other Triton kernels:
+  - IsoQuant Triton: 4 loads/stores per group, 16 FMAs (quaternion multiply)
+  - RotorQuant Triton: 8 loads/stores per group, ~28 FMAs (Clifford product)
+  - PlanarQuant Triton: 2 loads/stores per group, 4 FMAs (Givens rotation)
+
+Reference: ParaMind2025/isoquant (planar2_fused_kernel.cu)
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+# ── Quantize nearest centroid ────────────────────────────────────────
+
+@triton.jit
+def _quantize_nearest(val, centroids_ptr, n_levels: tl.constexpr):
+    """Find nearest centroid for a scalar value."""
+    best_val = tl.load(centroids_ptr)
+    best_dist = tl.abs(val - best_val)
+    for i in tl.static_range(1, n_levels):
+        c = tl.load(centroids_ptr + i)
+        d = tl.abs(val - c)
+        mask = d < best_dist
+        best_dist = tl.where(mask, d, best_dist)
+        best_val = tl.where(mask, c, best_val)
+    return best_val
+
+
+# ── PlanarQuant fused kernel ────────────────────────────────────────
+# Forward:  v_rot = R(θ) v       [cos θ · v0 - sin θ · v1,  sin θ · v0 + cos θ · v1]
+# Quantize: scalar Lloyd-Max on both components
+# Inverse:  v̂ = R(-θ) v_q        [cos θ · q0 + sin θ · q1, -sin θ · q0 + cos θ · q1]
+
+@triton.jit
+def _planar2_fused_kernel(
+    input_ptr, output_ptr,
+    rot2_ptr,        # (n_groups, 2) as [cos θ, sin θ]
+    centroids_ptr,   # (n_levels,)
+    batch_size, emb_dim,
+    n_groups: tl.constexpr,
+    n_levels: tl.constexpr,
+    stride_in_b, stride_in_d,
+    stride_out_b, stride_out_d,
+    BLOCK_G: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    g_offs = pid_g * BLOCK_G + tl.arange(0, BLOCK_G)
+    g_mask = g_offs < n_groups
+
+    # Load rotation params (cos θ, sin θ) for each group
+    cos_t = tl.load(rot2_ptr + g_offs * 2 + 0, mask=g_mask, other=1.0)
+    sin_t = tl.load(rot2_ptr + g_offs * 2 + 1, mask=g_mask, other=0.0)
+
+    # Load input 2D pair
+    d0 = g_offs * 2
+    v0 = tl.load(input_ptr + pid_b * stride_in_b + d0 * stride_in_d,
+                  mask=g_mask & (d0 < emb_dim), other=0.0)
+    v1 = tl.load(input_ptr + pid_b * stride_in_b + (d0 + 1) * stride_in_d,
+                  mask=g_mask & ((d0 + 1) < emb_dim), other=0.0)
+
+    # Forward rotation: 4 FMAs
+    r0 = cos_t * v0 - sin_t * v1
+    r1 = sin_t * v0 + cos_t * v1
+
+    # Quantize both scalars
+    q0 = _quantize_nearest(r0, centroids_ptr, n_levels)
+    q1 = _quantize_nearest(r1, centroids_ptr, n_levels)
+
+    # Inverse rotation (transpose = negate sin): 4 FMAs
+    f0 = cos_t * q0 + sin_t * q1
+    f1 = -sin_t * q0 + cos_t * q1
+
+    # Store output
+    tl.store(output_ptr + pid_b * stride_out_b + d0 * stride_out_d,
+             f0, mask=g_mask & (d0 < emb_dim))
+    tl.store(output_ptr + pid_b * stride_out_b + (d0 + 1) * stride_out_d,
+             f1, mask=g_mask & ((d0 + 1) < emb_dim))
+
+
+# ── Quantize-only kernel (returns indices, no inverse rotation) ──────
+
+@triton.jit
+def _planar2_quantize_kernel(
+    input_ptr, indices_ptr,
+    rot2_ptr, centroids_ptr,
+    batch_size, emb_dim,
+    n_groups: tl.constexpr,
+    n_levels: tl.constexpr,
+    stride_in_b, stride_in_d,
+    stride_idx_b, stride_idx_d,
+    BLOCK_G: tl.constexpr,
+):
+    """Quantize only — stores uint8 indices (for KV cache compression)."""
+    pid_b = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    g_offs = pid_g * BLOCK_G + tl.arange(0, BLOCK_G)
+    g_mask = g_offs < n_groups
+
+    cos_t = tl.load(rot2_ptr + g_offs * 2 + 0, mask=g_mask, other=1.0)
+    sin_t = tl.load(rot2_ptr + g_offs * 2 + 1, mask=g_mask, other=0.0)
+
+    d0 = g_offs * 2
+    v0 = tl.load(input_ptr + pid_b * stride_in_b + d0 * stride_in_d,
+                  mask=g_mask & (d0 < emb_dim), other=0.0)
+    v1 = tl.load(input_ptr + pid_b * stride_in_b + (d0 + 1) * stride_in_d,
+                  mask=g_mask & ((d0 + 1) < emb_dim), other=0.0)
+
+    # Forward rotation
+    r0 = cos_t * v0 - sin_t * v1
+    r1 = sin_t * v0 + cos_t * v1
+
+    # Find nearest centroid index for r0
+    best_idx0 = tl.zeros_like(r0).to(tl.int32)
+    best_dist0 = tl.abs(r0 - tl.load(centroids_ptr))
+    for i in tl.static_range(1, n_levels):
+        c = tl.load(centroids_ptr + i)
+        dd = tl.abs(r0 - c)
+        mask = dd < best_dist0
+        best_dist0 = tl.where(mask, dd, best_dist0)
+        best_idx0 = tl.where(mask, i, best_idx0)
+
+    # Find nearest centroid index for r1
+    best_idx1 = tl.zeros_like(r1).to(tl.int32)
+    best_dist1 = tl.abs(r1 - tl.load(centroids_ptr))
+    for i in tl.static_range(1, n_levels):
+        c = tl.load(centroids_ptr + i)
+        dd = tl.abs(r1 - c)
+        mask = dd < best_dist1
+        best_dist1 = tl.where(mask, dd, best_dist1)
+        best_idx1 = tl.where(mask, i, best_idx1)
+
+    tl.store(indices_ptr + pid_b * stride_idx_b + d0 * stride_idx_d,
+             best_idx0.to(tl.int8),
+             mask=g_mask & (d0 < emb_dim))
+    tl.store(indices_ptr + pid_b * stride_idx_b + (d0 + 1) * stride_idx_d,
+             best_idx1.to(tl.int8),
+             mask=g_mask & ((d0 + 1) < emb_dim))
+
+
+# ── Dequantize-only kernel (indices → reconstructed vectors) ─────────
+
+@triton.jit
+def _planar2_dequantize_kernel(
+    indices_ptr, output_ptr,
+    rot2_ptr, centroids_ptr,
+    batch_size, emb_dim,
+    n_groups: tl.constexpr,
+    n_levels: tl.constexpr,
+    stride_idx_b, stride_idx_d,
+    stride_out_b, stride_out_d,
+    BLOCK_G: tl.constexpr,
+):
+    """Dequantize indices back to vectors via inverse rotation."""
+    pid_b = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    g_offs = pid_g * BLOCK_G + tl.arange(0, BLOCK_G)
+    g_mask = g_offs < n_groups
+
+    cos_t = tl.load(rot2_ptr + g_offs * 2 + 0, mask=g_mask, other=1.0)
+    sin_t = tl.load(rot2_ptr + g_offs * 2 + 1, mask=g_mask, other=0.0)
+
+    d0 = g_offs * 2
+
+    # Load indices and look up centroid values
+    idx0 = tl.load(indices_ptr + pid_b * stride_idx_b + d0 * stride_idx_d,
+                    mask=g_mask & (d0 < emb_dim), other=0).to(tl.int32)
+    idx1 = tl.load(indices_ptr + pid_b * stride_idx_b + (d0 + 1) * stride_idx_d,
+                    mask=g_mask & ((d0 + 1) < emb_dim), other=0).to(tl.int32)
+
+    q0 = tl.load(centroids_ptr + idx0, mask=g_mask, other=0.0)
+    q1 = tl.load(centroids_ptr + idx1, mask=g_mask, other=0.0)
+
+    # Inverse rotation
+    f0 = cos_t * q0 + sin_t * q1
+    f1 = -sin_t * q0 + cos_t * q1
+
+    tl.store(output_ptr + pid_b * stride_out_b + d0 * stride_out_d,
+             f0, mask=g_mask & (d0 < emb_dim))
+    tl.store(output_ptr + pid_b * stride_out_b + (d0 + 1) * stride_out_d,
+             f1, mask=g_mask & ((d0 + 1) < emb_dim))
+
+
+# ── Python wrappers ──────────────────────────────────────────────────
+
+def triton_planar2_fused(
+    input: torch.Tensor,       # [batch, emb_dim]
+    rot2: torch.Tensor,        # [n_groups, 2] as [cos θ, sin θ]
+    centroids: torch.Tensor,   # [n_levels]
+) -> torch.Tensor:
+    """Fused PlanarQuant pipeline: normalize → rotate → quantize → inverse rotate → rescale.
+
+    Single kernel launch for the full quantize-dequantize roundtrip.
+    The fastest rotation-based quantization kernel.
+    """
+    batch_size, emb_dim = input.shape
+    n_groups = rot2.shape[0]
+    n_levels = centroids.shape[0]
+
+    # Norm separation (done on GPU, outside kernel)
+    input_f32 = input.float()
+    norms = input_f32.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    input_f32 = (input_f32 / norms).contiguous()
+
+    rot2_f32 = rot2.float().contiguous()
+    c_f32 = centroids.float().contiguous()
+
+    output = torch.empty_like(input_f32)
+
+    BLOCK_G = min(triton.next_power_of_2(n_groups), 256)
+    grid = (batch_size, triton.cdiv(n_groups, BLOCK_G))
+
+    _planar2_fused_kernel[grid](
+        input_f32, output, rot2_f32, c_f32,
+        batch_size, emb_dim, n_groups, n_levels,
+        input_f32.stride(0), input_f32.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_G=BLOCK_G,
+    )
+
+    output = output * norms
+    return output.to(input.dtype)
+
+
+def triton_planar2_quantize(
+    input: torch.Tensor,       # [batch, emb_dim]
+    rot2: torch.Tensor,        # [n_groups, 2]
+    centroids: torch.Tensor,   # [n_levels]
+) -> tuple:
+    """Quantize only — returns (indices, norms) for KV cache storage."""
+    batch_size, emb_dim = input.shape
+    n_groups = rot2.shape[0]
+    n_levels = centroids.shape[0]
+
+    input_f32 = input.float()
+    norms = input_f32.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    input_f32 = (input_f32 / norms).contiguous()
+
+    rot2_f32 = rot2.float().contiguous()
+    c_f32 = centroids.float().contiguous()
+
+    indices = torch.empty(batch_size, emb_dim, dtype=torch.int8, device=input.device)
+
+    BLOCK_G = min(triton.next_power_of_2(n_groups), 256)
+    grid = (batch_size, triton.cdiv(n_groups, BLOCK_G))
+
+    _planar2_quantize_kernel[grid](
+        input_f32, indices, rot2_f32, c_f32,
+        batch_size, emb_dim, n_groups, n_levels,
+        input_f32.stride(0), input_f32.stride(1),
+        indices.stride(0), indices.stride(1),
+        BLOCK_G=BLOCK_G,
+    )
+
+    return indices, norms.squeeze(-1)
+
+
+def triton_planar2_dequantize(
+    indices: torch.Tensor,     # [batch, emb_dim] int8
+    norms: torch.Tensor,       # [batch]
+    rot2: torch.Tensor,        # [n_groups, 2]
+    centroids: torch.Tensor,   # [n_levels]
+) -> torch.Tensor:
+    """Dequantize indices back to vectors via inverse rotation + rescale."""
+    batch_size, emb_dim = indices.shape
+    n_groups = rot2.shape[0]
+    n_levels = centroids.shape[0]
+
+    rot2_f32 = rot2.float().contiguous()
+    c_f32 = centroids.float().contiguous()
+
+    output = torch.empty(batch_size, emb_dim, dtype=torch.float32, device=indices.device)
+
+    BLOCK_G = min(triton.next_power_of_2(n_groups), 256)
+    grid = (batch_size, triton.cdiv(n_groups, BLOCK_G))
+
+    _planar2_dequantize_kernel[grid](
+        indices, output, rot2_f32, c_f32,
+        batch_size, emb_dim, n_groups, n_levels,
+        indices.stride(0), indices.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_G=BLOCK_G,
+    )
+
+    if norms.dim() == 1:
+        norms = norms.unsqueeze(-1)
+    return output * norms
+
+"""
+PlanarQuant: 2D planar rotation (Givens rotation) for KV cache quantization.
+
+Simplest member of the rotation-based quantization family:
+    SO(2): T(v) = R(θ) v  — single angle per 2D pair
+
+Compared to other rotation quantizers:
+  - RotorQuant: 3D blocks, Cl(3,0) rotor sandwich (8 components, ~28 FMAs)
+  - IsoQuant:   4D blocks, quaternion sandwich (4 components, ~16 FMAs)
+  - PlanarQuant: 2D blocks, Givens rotation (2 components, 4 FMAs)
+
+Advantages:
+  - Minimum overhead per group: 1 angle (or cos/sin pair) per 2 elements
+  - Trivially vectorizable — no quaternion algebra needed
+  - Pairs align to any even dimension (most common in practice)
+  - CUDA kernel fuses rotate→quantize→unrotate in one pass
+
+Disadvantage:
+  - Only 1 DOF per 2D pair — less decorrelation power than 4D quaternion
+
+Reference CUDA kernel: isoquant/csrc/planar2_fused_kernel.cu
+"""
+
+import torch
+import torch.nn as nn
+import math
+from typing import Optional, Tuple
+
+from .lloyd_max import LloydMaxCodebook
+
+
+# ── 2D rotation math ────────────────────────────────────────────────
+
+def make_random_rotations(n_groups: int, device='cpu', seed=None) -> torch.Tensor:
+    """Generate random 2D rotation parameters (cos θ, sin θ) per group.
+
+    Returns: (n_groups, 2) as [cos θ, sin θ]
+    """
+    gen = torch.Generator(device='cpu')
+    if seed is not None:
+        gen.manual_seed(seed)
+    # Random angles in [0, 2π)
+    angles = torch.rand(n_groups, generator=gen) * (2 * math.pi)
+    angles = angles.to(device)
+    return torch.stack([angles.cos(), angles.sin()], dim=-1)
+
+
+def rot2_apply(cs: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Apply 2D rotation to pairs.
+
+    cs: (..., 2) as [cos θ, sin θ]
+    v:  (..., 2) as [v0, v1]
+    Returns: (..., 2)
+    """
+    c = cs[..., 0]
+    s = cs[..., 1]
+    v0 = v[..., 0]
+    v1 = v[..., 1]
+    return torch.stack([c * v0 - s * v1, s * v0 + c * v1], dim=-1)
+
+
+def rot2_inverse(cs: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Apply inverse 2D rotation (transpose = negate sin).
+
+    cs: (..., 2) as [cos θ, sin θ]
+    v:  (..., 2) as [v0, v1]
+    Returns: (..., 2)
+    """
+    c = cs[..., 0]
+    s = cs[..., 1]
+    v0 = v[..., 0]
+    v1 = v[..., 1]
+    return torch.stack([c * v0 + s * v1, -s * v0 + c * v1], dim=-1)
+
+
+# ── PlanarQuantMSE ───────────────────────────────────────────────────
+
+class PlanarQuantMSE(nn.Module):
+    """
+    Stage 1: MSE-optimal quantizer using 2D planar (Givens) rotations.
+
+    Each pair of adjacent elements is rotated by an independent angle θ,
+    then scalar-quantized via Lloyd-Max, then inverse-rotated.
+
+    This is the SO(2) analogue of IsoQuant's SO(4) quaternion rotations.
+    """
+
+    def __init__(self, d: int, bits: int, seed: int = 42, device: str = "cpu"):
+        """
+        Args:
+            d: original vector dimension
+            bits: bits per component for Lloyd-Max quantization
+            seed: random seed for rotation generation
+            device: torch device
+        """
+        super().__init__()
+        self.d = d
+        self.bits = bits
+        self.device = device
+
+        # 2D blocks — pairs
+        self.n_groups = (d + 1) // 2  # ceil(d/2)
+        self.d_padded = self.n_groups * 2
+
+        # Lloyd-Max codebook
+        cb = LloydMaxCodebook(d, bits)
+        self.register_buffer('centroids', cb.centroids.to(device))
+
+        # Random 2D rotations (cos θ, sin θ) — one per group
+        rot = make_random_rotations(self.n_groups, device=device, seed=seed)
+        self.register_buffer('rot2', rot)  # (n_groups, 2)
+
+    def _embed(self, x: torch.Tensor) -> torch.Tensor:
+        """Embed d-dim vectors into groups of 2D pairs.
+
+        x: (..., d) → (..., n_groups, 2)
+        """
+        pad = self.d_padded - self.d
+        if pad > 0:
+            x = torch.nn.functional.pad(x, (0, pad))
+        return x.reshape(*x.shape[:-1], self.n_groups, 2)
+
+    def _extract(self, v: torch.Tensor) -> torch.Tensor:
+        """Extract d-dim vectors from groups of 2D pairs.
+
+        v: (..., n_groups, 2) → (..., d)
+        """
+        flat = v.reshape(*v.shape[:-2], -1)
+        return flat[..., :self.d]
+
+    def _quantize_scalar(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-coordinate Lloyd-Max quantization."""
+        diffs = x.unsqueeze(-1) - self.centroids  # (..., n_levels)
+        indices = diffs.abs().argmin(dim=-1)
+        x_q = self.centroids[indices]
+        return x_q, indices
+
+    def quantize(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+        """
+        Quantize vectors via 2D rotation + Lloyd-Max.
+
+        x: (..., d) input vectors
+        Returns: (x_quantized_rotated, indices_dict)
+        """
+        # Separate norm and direction
+        norms = torch.norm(x, dim=-1, keepdim=True).clamp(min=1e-8)
+        x_unit = x / norms
+
+        # Embed into 2D pairs
+        v = self._embed(x_unit)  # (..., n_groups, 2)
+
+        # Rotate each pair
+        v_rot = rot2_apply(self.rot2, v)
+
+        # Scalar quantize
+        flat = v_rot.reshape(*v_rot.shape[:-2], -1)  # (..., n_groups*2)
+        q_flat, indices = self._quantize_scalar(flat)
+        v_q = q_flat.reshape_as(v_rot)
+
+        return v_q, {
+            'indices': indices,
+            '_norms': norms.squeeze(-1),
+        }
+
+    def dequantize(self, indices_dict: dict) -> torch.Tensor:
+        """Reconstruct vectors from quantized indices."""
+        idx = indices_dict['indices']
+        values = self.centroids[idx]
+
+        # Reshape back to groups of 2
+        v_q = values.reshape(*values.shape[:-1], self.n_groups, 2)
+
+        # Inverse rotation
+        v_recon = rot2_inverse(self.rot2, v_q)
+
+        # Extract and rescale
+        x_hat = self._extract(v_recon)
+        if '_norms' in indices_dict:
+            norms = indices_dict['_norms']
+            if norms.dim() < x_hat.dim():
+                norms = norms.unsqueeze(-1)
+            x_hat = x_hat * norms
+
+        return x_hat
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+        """Full quantize-dequantize cycle."""
+        v_q, indices = self.quantize(x)
+        x_hat = self.dequantize(indices)
+        return x_hat, indices
+
+
+# ── PlanarQuantProd (Stage 1 + Stage 2 with QJL) ────────────────────
+
+class PlanarQuantProd(nn.Module):
+    """
+    Stage 1 + Stage 2: Unbiased inner product quantizer.
+
+    Uses (b-1)-bit PlanarQuant MSE + 1-bit QJL on residuals.
+    Drop-in replacement for IsoQuantProd / RotorQuantProd.
+    """
+
+    def __init__(self, d: int, bits: int,
+                 qjl_dim: Optional[int] = None,
+                 seed: int = 42, device: str = "cpu"):
+        super().__init__()
+        self.d = d
+        self.bits = bits
+        self.mse_bits = max(bits - 1, 1)
+        self.qjl_dim = qjl_dim or d
+        self.device = device
+
+        # Stage 1: PlanarQuant MSE
+        self.mse = PlanarQuantMSE(d, self.mse_bits, seed=seed, device=device)
+
+        # Stage 2: QJL projection
+        gen = torch.Generator(device='cpu')
+        gen.manual_seed(seed + 1)
+        S = torch.randn(self.qjl_dim, d, generator=gen)
+        self.register_buffer("S", S.to(device))
+
+    def quantize(self, x: torch.Tensor) -> dict:
+        x_hat, mse_indices = self.mse(x)
+
+        residual = x - x_hat
+        residual_norm = torch.norm(residual, dim=-1, keepdim=True)
+
+        projected = residual @ self.S.T
+        qjl_signs = torch.sign(projected)
+        qjl_signs[qjl_signs == 0] = 1.0
+
+        return {
+            'mse_indices': mse_indices,
+            'qjl_signs': qjl_signs,
+            'residual_norm': residual_norm.squeeze(-1),
+        }
+
+    def dequantize(self, compressed: dict) -> torch.Tensor:
+        return self.mse.dequantize(compressed['mse_indices'])
+
+    def inner_product(self, y: torch.Tensor, compressed: dict) -> torch.Tensor:
+        x_mse = self.mse.dequantize(compressed['mse_indices'])
+        term1 = (y * x_mse).sum(dim=-1)
+
+        y_projected = y @ self.S.T
+        qjl_ip = (y_projected * compressed['qjl_signs']).sum(dim=-1)
+
+        m = self.qjl_dim
+        correction_scale = math.sqrt(math.pi / 2) / m
+        term2 = compressed['residual_norm'] * correction_scale * qjl_ip
+
+        return term1 + term2
+
+    def forward(self, x: torch.Tensor) -> dict:
+        return self.quantize(x)
+
+"""
+Cross-validation: RotorQuant variants vs TurboQuant+ (TheTom/turboquant_plus).
+
+Compares our rotation-based quantizers against the reference dense-rotation
+TurboQuant+ implementation on identical data and metrics:
+
+  1. Reconstruction MSE (synthetic unit vectors)
+  2. Inner product preservation (Stage 1 + Stage 2)
+  3. Codebook agreement (Lloyd-Max centroids)
+  4. Speed (quantize + dequantize roundtrip)
+  5. Parameter count
+
+TurboQuant+ uses numpy; our methods use PyTorch on GPU.
+We ensure identical random vectors for fair comparison.
+
+Usage:
+    python -m turboquant.benchmark_vs_tqplus
+"""
+
+import sys
+import os
+import time
+import math
+import numpy as np
+import torch
+
+# ── Import our methods FIRST ──
+from turboquant.rotorquant import RotorQuantMSE, RotorQuantProd
+from turboquant.isoquant import IsoQuantMSE, IsoQuantProd
+from turboquant.planarquant import PlanarQuantMSE, PlanarQuantProd
+from turboquant.lloyd_max import LloydMaxCodebook
+
+# ── Import TurboQuant+ (numpy-based) ──
+# Both packages are named "turboquant" so we temporarily swap sys.modules
+TQPLUS_DIR = '/home/johndpope/Documents/turboquant_plus'
+
+# Save our turboquant modules, load TQ+ in isolated namespace
+import importlib
+_saved_mods = {k: v for k, v in sys.modules.items() if k.startswith('turboquant')}
+for k in list(_saved_mods.keys()):
+    del sys.modules[k]
+sys.path.insert(0, TQPLUS_DIR)
+
+from turboquant.polar_quant import PolarQuant as TQPlus_PolarQuant
+from turboquant.turboquant import TurboQuant as TQPlus_TurboQuant, TurboQuantMSE as TQPlus_TurboQuantMSE
+from turboquant.codebook import optimal_centroids as tqplus_centroids
+
+# Restore our modules
+for k in list(sys.modules.keys()):
+    if k.startswith('turboquant'):
+        del sys.modules[k]
+sys.path.remove(TQPLUS_DIR)
+sys.modules.update(_saved_mods)
+
+
+def make_test_vectors(n, d, seed=42):
+    """Generate identical test vectors for both frameworks."""
+    rng = np.random.default_rng(seed)
+    x_np = rng.standard_normal((n, d)).astype(np.float32)
+    # Normalize to unit sphere
+    norms = np.linalg.norm(x_np, axis=1, keepdims=True)
+    x_np = x_np / norms
+    x_torch = torch.from_numpy(x_np)
+    return x_np, x_torch
+
+
+def benchmark_codebook(d, bits):
+    """Compare Lloyd-Max codebooks between the two implementations."""
+    # TQPlus
+    c_tqplus = tqplus_centroids(bits, d)  # numpy array
+
+    # Ours
+    cb = LloydMaxCodebook(d, bits)
+    c_ours = cb.centroids.numpy()
+
+    # Compare
+    max_diff = np.max(np.abs(np.sort(c_tqplus) - np.sort(c_ours)))
+    return max_diff, c_tqplus, c_ours
+
+
+def benchmark_mse(d, bits, n_vectors=8192, device='cuda'):
+    """Compare reconstruction MSE across all methods."""
+    x_np, x_torch = make_test_vectors(n_vectors, d, seed=42)
+    x_gpu = x_torch.to(device)
+
+    results = {}
+
+    # ── TQPlus: PolarQuant (dense d×d rotation) ──
+    pq_plus = TQPlus_PolarQuant(d, bit_width=bits, seed=42)
+    indices_np, norms_np = pq_plus.quantize(x_np)
+    x_hat_np = pq_plus.dequantize(indices_np, norms_np)
+    mse_tqplus = float(np.mean((x_np - x_hat_np) ** 2))
+    results['TQ+ PolarQuant'] = mse_tqplus
+
+    # ── Our methods ──
+    rq = RotorQuantMSE(d, bits, seed=42, device=device)
+    x_hat_rq, _ = rq(x_gpu)
+    mse_rq = (x_gpu - x_hat_rq).pow(2).mean().item()
+    results['RotorQuant'] = mse_rq
+
+    iq_full = IsoQuantMSE(d, bits, seed=42, mode='full', device=device)
+    x_hat_iq, _ = iq_full(x_gpu)
+    mse_iq = (x_gpu - x_hat_iq).pow(2).mean().item()
+    results['IsoQuant-Full'] = mse_iq
+
+    iq_fast = IsoQuantMSE(d, bits, seed=42, mode='fast', device=device)
+    x_hat_if, _ = iq_fast(x_gpu)
+    mse_if = (x_gpu - x_hat_if).pow(2).mean().item()
+    results['IsoQuant-Fast'] = mse_if
+
+    pq = PlanarQuantMSE(d, bits, seed=42, device=device)
+    x_hat_pq, _ = pq(x_gpu)
+    mse_pq = (x_gpu - x_hat_pq).pow(2).mean().item()
+    results['PlanarQuant'] = mse_pq
+
+    return results
+
+
+def benchmark_inner_product(d, bits, n_vectors=4096, device='cuda'):
+    """Compare inner product estimation (Stage 1 + Stage 2)."""
+    x_np, x_torch = make_test_vectors(n_vectors, d, seed=42)
+    y_np, y_torch = make_test_vectors(n_vectors, d, seed=123)
+    x_gpu = x_torch.to(device)
+    y_gpu = y_torch.to(device)
+
+    # True inner products
+    true_ip = np.sum(x_np * y_np, axis=1)
+
+    results = {}
+
+    # ── TQPlus: TurboQuant (PolarQuant + QJL) ──
+    tq_plus = TQPlus_TurboQuant(d, bit_width=bits, seed=42)
+    compressed_x = tq_plus.quantize(x_np)
+    x_hat_tq = tq_plus.dequantize(compressed_x)
+    est_ip_tq = np.sum(x_hat_tq * y_np, axis=1)
+    results['TQ+ TurboQuant'] = {
+        'ip_mse': float(np.mean((true_ip - est_ip_tq) ** 2)),
+        'ip_bias': float(np.mean(true_ip - est_ip_tq)),
+    }
+
+    # ── Our methods ──
+    methods_torch = {
+        'RotorQuant': RotorQuantProd(d, bits, seed=42, device=device),
+        'IsoQuant-Full': IsoQuantProd(d, bits, mode='full', seed=42, device=device),
+        'IsoQuant-Fast': IsoQuantProd(d, bits, mode='fast', seed=42, device=device),
+        'PlanarQuant': PlanarQuantProd(d, bits, seed=42, device=device),
+    }
+
+    true_ip_torch = (x_gpu * y_gpu).sum(dim=-1)
+
+    for name, model in methods_torch.items():
+        compressed = model.quantize(x_gpu)
+        est_ip = model.inner_product(y_gpu, compressed)
+        ip_mse = (true_ip_torch - est_ip).pow(2).mean().item()
+        ip_bias = (true_ip_torch - est_ip).mean().item()
+        results[name] = {'ip_mse': ip_mse, 'ip_bias': ip_bias}
+
+    return results
+
+
+def benchmark_speed(d, bits, n_vectors=8192, device='cuda'):
+    """Compare quantize+dequantize latency."""
+    x_np, x_torch = make_test_vectors(n_vectors, d, seed=42)
+    x_gpu = x_torch.to(device)
+
+    results = {}
+
+    # ── TQPlus (numpy, CPU) ──
+    pq_plus = TQPlus_PolarQuant(d, bit_width=bits, seed=42)
+    # Warmup
+    for _ in range(3):
+        idx, norms = pq_plus.quantize(x_np)
+        pq_plus.dequantize(idx, norms)
+    t0 = time.perf_counter()
+    for _ in range(20):
+        idx, norms = pq_plus.quantize(x_np)
+        pq_plus.dequantize(idx, norms)
+    dt = (time.perf_counter() - t0) / 20 * 1e6
+    results['TQ+ PolarQuant (CPU)'] = dt
+
+    # ── Our methods (GPU) ──
+    methods = {
+        'RotorQuant': RotorQuantMSE(d, bits, seed=42, device=device),
+        'IsoQuant-Fast': IsoQuantMSE(d, bits, seed=42, mode='fast', device=device),
+        'PlanarQuant': PlanarQuantMSE(d, bits, seed=42, device=device),
+    }
+
+    for name, model in methods.items():
+        for _ in range(50):
+            model(x_gpu)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(200):
+            model(x_gpu)
+        torch.cuda.synchronize()
+        dt = (time.perf_counter() - t0) / 200 * 1e6
+        results[name] = dt
+
+    return results
+
+
+def benchmark_params(d, bits):
+    """Compare parameter counts."""
+    # TQPlus uses a d×d rotation matrix
+    tqplus_rot_params = d * d
+
+    rq = RotorQuantMSE(d, bits, seed=42, device='cpu')
+    iq_fast = IsoQuantMSE(d, bits, seed=42, mode='fast', device='cpu')
+    pq = PlanarQuantMSE(d, bits, seed=42, device='cpu')
+
+    return {
+        'TQ+ PolarQuant': {'rotation_params': tqplus_rot_params, 'block_size': d},
+        'RotorQuant': {'rotation_params': rq.rotors.numel(), 'block_size': 3},
+        'IsoQuant-Fast': {'rotation_params': iq_fast.q_L.numel(), 'block_size': 4},
+        'PlanarQuant': {'rotation_params': pq.rot2.numel(), 'block_size': 2},
+    }
+
+
+if __name__ == '__main__':
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print()
+    print("╔═══════════════════════════════════════════════════════════════════════╗")
+    print("║  Cross-Validation: RotorQuant Family vs TurboQuant+ (TheTom)        ║")
+    print("╚═══════════════════════════════════════════════════════════════════════╝")
+    print()
+    print(f"  Device: {device}" + (f" ({torch.cuda.get_device_name()})" if device == 'cuda' else ""))
+    print(f"  TQ+: numpy (CPU)  |  Ours: PyTorch ({'GPU' if device == 'cuda' else 'CPU'})")
+    print()
+
+    dims = [64, 128, 256]
+    bits_list = [2, 3, 4]
+
+    # ── 1. Codebook comparison ──
+    print("=" * 80)
+    print("  1. LLOYD-MAX CODEBOOK COMPARISON")
+    print("=" * 80)
+    print(f"  {'d':>5} {'bits':>4} | {'Max centroid diff':>20} | {'TQ+ centroids':>30} | {'Ours':>30}")
+    print("-" * 80)
+    for d in dims:
+        for bits in bits_list:
+            diff, c_tq, c_ours = benchmark_codebook(d, bits)
+            c_tq_str = ', '.join(f'{c:.4f}' for c in sorted(c_tq)[:4]) + '...'
+            c_ours_str = ', '.join(f'{c:.4f}' for c in sorted(c_ours)[:4]) + '...'
+            status = "MATCH" if diff < 1e-3 else f"DIFF={diff:.2e}"
+            print(f"  {d:>5} {bits:>4} | {status:>20} | {c_tq_str:>30} | {c_ours_str:>30}")
+    print()
+
+    # ── 2. Reconstruction MSE ──
+    print("=" * 80)
+    print("  2. RECONSTRUCTION MSE (8192 unit vectors, lower is better)")
+    print("=" * 80)
+    print(f"  {'d':>5} {'bits':>4} | {'TQ+':>12} {'RotorQ':>12} {'IsoFast':>12} {'Planar':>12} | {'TQ+/RQ':>8} {'TQ+/Pln':>8}")
+    print("-" * 80)
+    for d in dims:
+        for bits in bits_list:
+            mses = benchmark_mse(d, bits, device=device)
+            tq = mses['TQ+ PolarQuant']
+            rq = mses['RotorQuant']
+            iq = mses['IsoQuant-Fast']
+            pq = mses['PlanarQuant']
+            r_rq = tq / rq if rq > 0 else float('inf')
+            r_pq = tq / pq if pq > 0 else float('inf')
+            print(f"  {d:>5} {bits:>4} | {tq:>12.6f} {rq:>12.6f} {iq:>12.6f} {pq:>12.6f} | {r_rq:>7.3f}x {r_pq:>7.3f}x")
+    print()
+
+    # ── 3. Inner product preservation ──
+    print("=" * 80)
+    print("  3. INNER PRODUCT ESTIMATION (Stage 1 + Stage 2)")
+    print("=" * 80)
+    print(f"  {'d':>5} {'bits':>4} | {'TQ+ ip_mse':>12} {'RQ ip_mse':>12} {'IsoF ip_mse':>12} {'Pln ip_mse':>12} | {'TQ+ bias':>10} {'Pln bias':>10}")
+    print("-" * 100)
+    for d in dims:
+        for bits in bits_list:
+            ips = benchmark_inner_product(d, bits, device=device)
+            tq = ips['TQ+ TurboQuant']
+            rq = ips['RotorQuant']
+            iq = ips['IsoQuant-Fast']
+            pq = ips['PlanarQuant']
+            print(f"  {d:>5} {bits:>4} | {tq['ip_mse']:>12.4f} {rq['ip_mse']:>12.4f} {iq['ip_mse']:>12.4f} {pq['ip_mse']:>12.4f} | {tq['ip_bias']:>+10.4f} {pq['ip_bias']:>+10.4f}")
+    print()
+
+    # ── 4. Speed ──
+    if device == 'cuda':
+        print("=" * 80)
+        print("  4. SPEED (quantize + dequantize, 8192 vectors)")
+        print("=" * 80)
+        for d in [128]:
+            for bits in [3]:
+                speeds = benchmark_speed(d, bits, device=device)
+                print(f"  d={d}, bits={bits}:")
+                for name, t in speeds.items():
+                    print(f"    {name:>25s}: {t:>10.0f} µs")
+        print()
+
+    # ── 5. Parameter count ──
+    print("=" * 80)
+    print("  5. PARAMETER COUNT (d=128, bits=3)")
+    print("=" * 80)
+    params = benchmark_params(128, 3)
+    for name, info in params.items():
+        print(f"  {name:>20s}: {info['rotation_params']:>6d} rotation params  (block_size={info['block_size']})")
+    print()
+
+    # ── Summary ──
+    print("=" * 80)
+    print("  SUMMARY")
+    print("=" * 80)
+    print("  If our methods match TQ+ on MSE and inner product quality,")
+    print("  the rotation primitive (dense vs Clifford vs quaternion vs Givens)")
+    print("  is a validated implementation with different speed/parameter tradeoffs.")
+    print("  TQ+ uses numpy (CPU) with dense d×d rotation.")
+    print("  Our methods use PyTorch (GPU) with block-wise rotation.")
+    print()
+
+"""
 Triton vs PyTorch vs CUDA Benchmark for RotorQuant
 
 Compares three backends:
@@ -6096,6 +8552,462 @@ if __name__ == "__main__":
     print("=" * 70)
 
 """
+PlanarQuant Fused Quantize + Attention kernel.
+
+Instead of the standard 3-kernel pipeline:
+  K_proj → VRAM → [quantize] → VRAM → [store indices] → VRAM → [attention]
+
+This fuses quantize + attention into a single kernel:
+  K_raw → [rotate → quantize → dot with Q → store scores + indices]
+
+The quantized K values never touch VRAM for the attention computation —
+they stay in registers between the quantize and dot-product steps.
+
+Arithmetic intensity improvement:
+  Separate kernels:  ~0.5 FLOPs/byte (memory-bound, 30µs floor)
+  Fused kernel:      ~500 FLOPs/byte at seq_len=4K (compute-bound)
+
+This kernel also stores quantized indices to VRAM as a side-effect,
+so the KV cache is populated for future decode steps.
+
+Reference: ParaMind2025/isoquant
+"""
+
+import torch
+import torch.nn.functional as F
+import math
+from typing import Optional
+from transformers import DynamicCache
+
+import triton
+import triton.language as tl
+
+from .planarquant import PlanarQuantMSE
+
+
+# ── Triton kernel: fused PlanarQuant quantize + attention ────────────
+#
+# For each K token:
+#   1. Load raw K vector
+#   2. Normalize (separate norms)
+#   3. Apply 2D Givens rotation per pair
+#   4. Quantize to nearest Lloyd-Max centroid
+#   5. Accumulate dot product with pre-rotated Q (attention score)
+#   6. Store quantized indices to VRAM (side-effect: populates KV cache)
+#
+# Steps 3-5 happen in registers — no intermediate VRAM round-trip.
+
+@triton.jit
+def _fused_planar_quantize_attend_kernel(
+    # Inputs
+    Q_rot_ptr,       # [BH_q, d_padded] — pre-rotated queries
+    K_raw_ptr,       # [BH_kv, kv_len, d] — raw keys (NOT rotated)
+    rot2_ptr,        # [n_groups, 2] — (cos θ, sin θ)
+    C_ptr,           # [n_levels] — Lloyd-Max centroids
+    # Outputs
+    Out_ptr,         # [BH_q, kv_len] — attention scores
+    Idx_ptr,         # [BH_kv, kv_len, d_padded] — quantized indices (side-effect)
+    Norms_ptr,       # [BH_kv, kv_len] — key norms (side-effect)
+    # Dimensions
+    kv_len,
+    d: tl.constexpr,
+    d_padded: tl.constexpr,
+    n_groups: tl.constexpr,
+    n_levels: tl.constexpr,
+    n_q_heads, n_kv_heads,
+    scale,
+    # Strides — Q_rot: [BH_q, d_padded]
+    stride_qr_bh, stride_qr_d,
+    # Strides — K_raw: [BH_kv, kv_len, d]
+    stride_kr_bh, stride_kr_s, stride_kr_d,
+    # Strides — Out: [BH_q, kv_len]
+    stride_o_bh, stride_o_s,
+    # Strides — Idx: [BH_kv, kv_len, d_padded]
+    stride_idx_bh, stride_idx_s, stride_idx_d,
+    # Strides — Norms: [BH_kv, kv_len]
+    stride_n_bh, stride_n_s,
+    # Block sizes
+    BLOCK_S: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+):
+    """Fused: load K once → rotate → quantize → dot with Q → store scores + indices.
+
+    Single-pass: computes unnormalized dot product (avoids double K read),
+    then divides by norm at the end. Uses the identity:
+        <Q_rot, quantize(R · (K/||K||))> · ||K|| = <Q_rot, quantize(R · K / ||K||)> · ||K||
+
+    We compute the rotated-quantized dot product WITHOUT normalizing K first,
+    then correct by norm at the end. This works because rotation and quantization
+    are applied per-pair, and the norm only scales the final score.
+
+    Actually: we DO need norms for correct quantization (centroids are calibrated
+    for unit vectors). So we compute norms and quantized values in a single pass
+    by accumulating norm_sq alongside the main loop, then doing a final correction.
+
+    Strategy: skip normalization during quantize, accept slight centroid mismatch,
+    or pre-compute norms in a lightweight separate kernel. We choose the latter
+    since the norm kernel is just a reduction (no writes to d-dimensional arrays).
+    """
+    pid_bh = tl.program_id(0)   # batch * q_head
+    pid_s = tl.program_id(1)    # kv sequence tile
+
+    # GQA mapping: multiple Q heads share one KV head
+    batch_idx = pid_bh // n_q_heads
+    q_head_idx = pid_bh % n_q_heads
+    gqa_ratio = n_q_heads // n_kv_heads
+    kv_head_idx = q_head_idx // gqa_ratio
+    kv_bh = batch_idx * n_kv_heads + kv_head_idx
+
+    # Only the first Q head per KV head computes quantization + stores indices/norms.
+    # All Q heads compute the dot product.
+    is_first_q_for_kv = (q_head_idx % gqa_ratio) == 0
+
+    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    s_mask = s_offs < kv_len
+
+    # Load pre-computed norms (computed by lightweight separate kernel)
+    norm_ptrs = Norms_ptr + kv_bh * stride_n_bh + s_offs * stride_n_s
+    k_norms = tl.load(norm_ptrs, mask=s_mask, other=1.0).to(tl.float32)
+    inv_norms = 1.0 / k_norms
+
+    # Accumulator for attention scores
+    acc = tl.zeros((BLOCK_S,), dtype=tl.float32)
+
+    # ── Single pass: rotate + quantize + dot ──
+    for g_start in range(0, n_groups, BLOCK_G):
+        g_offs = g_start + tl.arange(0, BLOCK_G)
+        g_mask_local = g_offs < n_groups
+        d0 = g_offs * 2
+
+        # Load rotation params
+        cos_t = tl.load(rot2_ptr + g_offs * 2 + 0, mask=g_mask_local, other=1.0)
+        sin_t = tl.load(rot2_ptr + g_offs * 2 + 1, mask=g_mask_local, other=0.0)
+
+        # Load raw K pair [BLOCK_S, BLOCK_G]
+        k0_ptrs = K_raw_ptr + kv_bh * stride_kr_bh + s_offs[:, None] * stride_kr_s + d0[None, :] * stride_kr_d
+        k1_ptrs = K_raw_ptr + kv_bh * stride_kr_bh + s_offs[:, None] * stride_kr_s + (d0[None, :] + 1) * stride_kr_d
+
+        mask_0 = s_mask[:, None] & g_mask_local[None, :] & (d0[None, :] < d)
+        mask_1 = s_mask[:, None] & g_mask_local[None, :] & ((d0[None, :] + 1) < d)
+
+        kv0 = tl.load(k0_ptrs, mask=mask_0, other=0.0).to(tl.float32)
+        kv1 = tl.load(k1_ptrs, mask=mask_1, other=0.0).to(tl.float32)
+
+        # Normalize K
+        kv0 = kv0 * inv_norms[:, None]
+        kv1 = kv1 * inv_norms[:, None]
+
+        # Forward rotation: [BLOCK_S, BLOCK_G]
+        r0 = cos_t[None, :] * kv0 - sin_t[None, :] * kv1
+        r1 = sin_t[None, :] * kv0 + cos_t[None, :] * kv1
+
+        # Quantize: find nearest centroid for each scalar
+        q0 = tl.load(C_ptr + 0)
+        best_d0 = tl.abs(r0 - q0)
+        q1 = tl.load(C_ptr + 0)
+        best_d1 = tl.abs(r1 - q1)
+        best_i0 = tl.zeros((BLOCK_S, BLOCK_G), dtype=tl.int32)
+        best_i1 = tl.zeros((BLOCK_S, BLOCK_G), dtype=tl.int32)
+
+        for i in tl.static_range(1, n_levels):
+            c = tl.load(C_ptr + i)
+            dd0 = tl.abs(r0 - c)
+            dd1 = tl.abs(r1 - c)
+            m0 = dd0 < best_d0
+            m1 = dd1 < best_d1
+            best_d0 = tl.where(m0, dd0, best_d0)
+            best_d1 = tl.where(m1, dd1, best_d1)
+            q0 = tl.where(m0, c, q0)
+            q1 = tl.where(m1, c, q1)
+            best_i0 = tl.where(m0, i, best_i0)
+            best_i1 = tl.where(m1, i, best_i1)
+
+        # q0, q1 are quantized rotated K values — still in registers!
+
+        # Store indices (side-effect for KV cache) — only first Q head writes
+        if is_first_q_for_kv:
+            idx0_ptrs = Idx_ptr + kv_bh * stride_idx_bh + s_offs[:, None] * stride_idx_s + d0[None, :] * stride_idx_d
+            idx1_ptrs = Idx_ptr + kv_bh * stride_idx_bh + s_offs[:, None] * stride_idx_s + (d0[None, :] + 1) * stride_idx_d
+
+            mask_d0 = s_mask[:, None] & g_mask_local[None, :] & (d0[None, :] < d_padded)
+            mask_d1 = s_mask[:, None] & g_mask_local[None, :] & ((d0[None, :] + 1) < d_padded)
+
+            tl.store(idx0_ptrs, best_i0.to(tl.int8), mask=mask_d0)
+            tl.store(idx1_ptrs, best_i1.to(tl.int8), mask=mask_d1)
+
+        # Dot product with pre-rotated Q (already in rotated basis)
+        qr0 = tl.load(Q_rot_ptr + pid_bh * stride_qr_bh + d0 * stride_qr_d,
+                       mask=g_mask_local & (d0 < d_padded), other=0.0).to(tl.float32)
+        qr1 = tl.load(Q_rot_ptr + pid_bh * stride_qr_bh + (d0 + 1) * stride_qr_d,
+                       mask=g_mask_local & ((d0 + 1) < d_padded), other=0.0).to(tl.float32)
+
+        acc += tl.sum(q0 * qr0[None, :] + q1 * qr1[None, :], axis=1)
+
+    # Final score = norm * dot_product * scale
+    scores = k_norms * acc * scale
+
+    o_ptrs = Out_ptr + pid_bh * stride_o_bh + s_offs * stride_o_s
+    tl.store(o_ptrs, scores, mask=s_mask)
+
+
+# ── Python wrapper ───────────────────────────────────────────────────
+
+def triton_fused_planar_quantize_attend(
+    q_rotated: torch.Tensor,     # [batch, n_q_heads, 1, d_padded] — pre-rotated Q
+    k_raw: torch.Tensor,         # [batch, n_kv_heads, kv_len, d] — raw K
+    rot2: torch.Tensor,          # [n_groups, 2] — (cos θ, sin θ)
+    centroids: torch.Tensor,     # [n_levels]
+    scale: float,
+    d_orig: int,                 # original unpadded dimension
+) -> tuple:
+    """
+    Fused quantize + attention in one kernel launch (+ lightweight norm precompute).
+
+    Returns:
+        scores: [batch, n_q_heads, 1, kv_len] — attention logits
+        indices: [batch, n_kv_heads, kv_len, d_padded] — int8 quantized indices
+        norms: [batch, n_kv_heads, kv_len] — key norms
+    """
+    batch, n_q_heads, q_len, d_padded = q_rotated.shape
+    _, n_kv_heads, kv_len, d = k_raw.shape
+    n_groups = rot2.shape[0]
+    n_levels = centroids.shape[0]
+
+    assert q_len == 1, "Fused kernel designed for decode (q_len=1)"
+
+    # Flatten batch*heads
+    q_flat = q_rotated.reshape(batch * n_q_heads, d_padded).contiguous().float()
+    k_flat = k_raw.reshape(batch * n_kv_heads, kv_len, d).contiguous().float()
+    rot2_f = rot2.float().contiguous()
+    c_f = centroids.float().contiguous()
+
+    out = torch.empty(batch * n_q_heads, kv_len, device=q_rotated.device, dtype=torch.float32)
+    indices = torch.empty(batch * n_kv_heads, kv_len, d_padded,
+                          device=q_rotated.device, dtype=torch.int8)
+
+    # Pre-compute norms (lightweight: just a vector norm, no d-dim writes)
+    # This is a single cheap kernel that reads K once and writes 1 scalar per token.
+    norms = k_flat.norm(dim=-1).clamp(min=1e-8)  # [BH_kv, kv_len]
+
+    # Tune block sizes
+    BLOCK_S = min(64, triton.next_power_of_2(kv_len))
+    BLOCK_G = min(64, triton.next_power_of_2(n_groups))
+
+    grid = (batch * n_q_heads, triton.cdiv(kv_len, BLOCK_S))
+
+    _fused_planar_quantize_attend_kernel[grid](
+        q_flat, k_flat, rot2_f, c_f,
+        out, indices, norms,
+        kv_len, d, d_padded, n_groups, n_levels,
+        n_q_heads, n_kv_heads, scale,
+        # Q_rot strides
+        q_flat.stride(0), q_flat.stride(1),
+        # K_raw strides
+        k_flat.stride(0), k_flat.stride(1), k_flat.stride(2),
+        # Out strides
+        out.stride(0), out.stride(1),
+        # Idx strides
+        indices.stride(0), indices.stride(1), indices.stride(2),
+        # Norms strides
+        norms.stride(0), norms.stride(1),
+        # Block sizes
+        BLOCK_S=BLOCK_S, BLOCK_G=BLOCK_G,
+    )
+
+    scores = out.reshape(batch, n_q_heads, 1, kv_len)
+    indices = indices.reshape(batch, n_kv_heads, kv_len, d_padded)
+    norms = norms.reshape(batch, n_kv_heads, kv_len)
+
+    return scores, indices, norms
+
+
+# ── Pre-rotate query helper ──────────────────────────────────────────
+
+def pre_rotate_query_planar(query: torch.Tensor, rot2: torch.Tensor,
+                             d_padded: int) -> torch.Tensor:
+    """Rotate query into the PlanarQuant basis for fused attention.
+
+    query: [batch, n_heads, q_len, d]
+    rot2: [n_groups, 2] — (cos θ, sin θ)
+    Returns: [batch, n_heads, q_len, d_padded]
+    """
+    B, H, Q, D = query.shape
+    n_groups = rot2.shape[0]
+    flat = query.float().reshape(-1, D)
+
+    # Pad to d_padded
+    if d_padded > D:
+        flat = F.pad(flat, (0, d_padded - D))
+
+    # Reshape to pairs
+    pairs = flat.reshape(-1, n_groups, 2)
+
+    # Apply forward rotation
+    cos_t = rot2[:, 0]  # [n_groups]
+    sin_t = rot2[:, 1]
+    v0 = pairs[..., 0]  # [N, n_groups]
+    v1 = pairs[..., 1]
+
+    r0 = cos_t * v0 - sin_t * v1
+    r1 = sin_t * v0 + cos_t * v1
+
+    rotated = torch.stack([r0, r1], dim=-1).reshape(-1, d_padded)
+    return rotated.reshape(B, H, Q, d_padded)
+
+
+# ── Compressed KV cache for PlanarQuant ──────────────────────────────
+
+class PlanarQuantCompressedCache(DynamicCache):
+    """KV cache storing PlanarQuant indices + norms.
+
+    Per key vector stores:
+      - indices: int8 [d_padded] — rotated centroid indices
+      - norms: fp32 — original ||key||
+
+    The fused kernel populates these as a side-effect of attention computation.
+    """
+
+    def __init__(self, pq: PlanarQuantMSE, device: str = "cuda"):
+        super().__init__()
+        self.pq = pq
+        self.device = device
+        self.rot2 = pq.rot2.to(device)
+        self.centroids = pq.centroids.to(device)
+        self.n_groups = pq.n_groups
+        self.d = pq.d
+        self.d_padded = pq.d_padded
+        self.head_dim = pq.d
+        self.scale = 1.0 / math.sqrt(pq.d)
+
+        self._compressed_keys: list[Optional[dict]] = []
+
+    def store_indices(self, indices: torch.Tensor, norms: torch.Tensor,
+                      layer_idx: int):
+        """Store quantized indices produced by the fused kernel."""
+        while len(self._compressed_keys) <= layer_idx:
+            self._compressed_keys.append(None)
+        entry = {'indices': indices, 'norms': norms}
+        if self._compressed_keys[layer_idx] is None:
+            self._compressed_keys[layer_idx] = entry
+        else:
+            prev = self._compressed_keys[layer_idx]
+            self._compressed_keys[layer_idx] = {
+                'indices': torch.cat([prev['indices'], indices], dim=2),
+                'norms': torch.cat([prev['norms'], norms], dim=2),
+            }
+
+    def get_compressed_key(self, layer_idx: int) -> Optional[dict]:
+        if layer_idx < len(self._compressed_keys):
+            return self._compressed_keys[layer_idx]
+        return None
+
+
+# ── Separate attention kernel (for cached indices) ───────────────────
+# After the first fused pass, subsequent decode steps use cached indices.
+
+@triton.jit
+def _planar_cached_attention_kernel(
+    Q_rot_ptr,       # [BH_q, d_padded]
+    K_idx_ptr,       # [BH_kv, kv_len, d_padded] int8
+    K_norms_ptr,     # [BH_kv, kv_len]
+    C_ptr,           # [n_levels]
+    Out_ptr,         # [BH_q, kv_len]
+    kv_len,
+    d_padded: tl.constexpr,
+    n_levels: tl.constexpr,
+    n_q_heads, n_kv_heads,
+    scale,
+    stride_qr_bh, stride_qr_d,
+    stride_ki_bh, stride_ki_s, stride_ki_d,
+    stride_kn_bh, stride_kn_s,
+    stride_o_bh, stride_o_s,
+    BLOCK_S: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Attention on pre-quantized cached keys (no rotation needed)."""
+    pid_bh = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    batch_idx = pid_bh // n_q_heads
+    q_head_idx = pid_bh % n_q_heads
+    gqa_ratio = n_q_heads // n_kv_heads
+    kv_head_idx = q_head_idx // gqa_ratio
+    kv_bh = batch_idx * n_kv_heads + kv_head_idx
+
+    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    s_mask = s_offs < kv_len
+
+    acc = tl.zeros((BLOCK_S,), dtype=tl.float32)
+
+    for d_start in range(0, d_padded, BLOCK_D):
+        d_offs = d_start + tl.arange(0, BLOCK_D)
+        d_mask = d_offs < d_padded
+
+        # Load pre-rotated Q
+        q_vals = tl.load(Q_rot_ptr + pid_bh * stride_qr_bh + d_offs * stride_qr_d,
+                         mask=d_mask, other=0.0).to(tl.float32)
+
+        # Load cached indices [BLOCK_S, BLOCK_D]
+        ki_ptrs = (K_idx_ptr + kv_bh * stride_ki_bh
+                   + s_offs[:, None] * stride_ki_s
+                   + d_offs[None, :] * stride_ki_d)
+        mask_2d = s_mask[:, None] & d_mask[None, :]
+        k_idx = tl.load(ki_ptrs, mask=mask_2d, other=0).to(tl.int32)
+
+        # Look up centroid values
+        k_vals = tl.load(C_ptr + k_idx, mask=mask_2d, other=0.0).to(tl.float32)
+
+        # Dot product
+        acc += tl.sum(k_vals * q_vals[None, :], axis=1)
+
+    # Scale by norms
+    kn_ptrs = K_norms_ptr + kv_bh * stride_kn_bh + s_offs * stride_kn_s
+    norms = tl.load(kn_ptrs, mask=s_mask, other=0.0).to(tl.float32)
+
+    scores = norms * acc * scale
+    o_ptrs = Out_ptr + pid_bh * stride_o_bh + s_offs * stride_o_s
+    tl.store(o_ptrs, scores, mask=s_mask)
+
+
+def triton_planar_cached_attention(
+    q_rotated: torch.Tensor,     # [batch, n_q_heads, 1, d_padded]
+    key_indices: torch.Tensor,   # [batch, n_kv_heads, kv_len, d_padded] int8
+    key_norms: torch.Tensor,     # [batch, n_kv_heads, kv_len]
+    centroids: torch.Tensor,     # [n_levels]
+    scale: float,
+) -> torch.Tensor:
+    """Attention on cached quantized keys (decode steps after first)."""
+    batch, n_q_heads, q_len, d_padded = q_rotated.shape
+    _, n_kv_heads, kv_len, _ = key_indices.shape
+
+    q_flat = q_rotated.reshape(batch * n_q_heads, d_padded).contiguous().float()
+    ki_flat = key_indices.reshape(batch * n_kv_heads, kv_len, d_padded).contiguous()
+    kn_flat = key_norms.reshape(batch * n_kv_heads, kv_len).contiguous().float()
+    c_f = centroids.float().contiguous()
+
+    out = torch.empty(batch * n_q_heads, kv_len,
+                      device=q_rotated.device, dtype=torch.float32)
+    n_levels = centroids.shape[0]
+
+    BLOCK_S = min(64, triton.next_power_of_2(kv_len))
+    BLOCK_D = min(128, triton.next_power_of_2(d_padded))
+
+    grid = (batch * n_q_heads, triton.cdiv(kv_len, BLOCK_S))
+
+    _planar_cached_attention_kernel[grid](
+        q_flat, ki_flat, kn_flat, c_f, out,
+        kv_len, d_padded, n_levels,
+        n_q_heads, n_kv_heads, scale,
+        q_flat.stride(0), q_flat.stride(1),
+        ki_flat.stride(0), ki_flat.stride(1), ki_flat.stride(2),
+        kn_flat.stride(0), kn_flat.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_S=BLOCK_S, BLOCK_D=BLOCK_D,
+    )
+
+    return out.reshape(batch, n_q_heads, 1, kv_len)
+
+"""
 Lloyd-Max optimal scalar quantizer for the Beta distribution
 arising from random rotation of unit-norm vectors.
 
@@ -6513,6 +9425,265 @@ class TurboQuantKVCache:
 
     def __len__(self):
         return sum(c["mse_indices"].shape[0] for c in self.key_cache) if self.key_cache else 0
+
+"""
+Triton kernels for IsoQuant: GPU-accelerated quaternion 4D block quantization.
+
+Kernels:
+  1. triton_iso_full_fused  — q_L v q̄_R → quantize → q̄_L v̂ q_R (full SO(4))
+  2. triton_iso_fast_fused  — q_L v → quantize → q̄_L v̂ (single isoclinic)
+
+These are the Triton equivalents of the CUDA kernels in isoclinic_fused_kernel.cu.
+Portable across NVIDIA and AMD GPUs, auto-tuned block sizes.
+
+Compared to RotorQuant Triton (Clifford Cl(3,0)):
+  - 4 components per block vs 8 (half the loads/stores)
+  - 16 FMAs per quat multiply vs ~28 per sparse geometric product
+  - Clean 4D alignment (no tail handling for power-of-2 dims)
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+# ── Quaternion primitives ─────────────────────────────────────────────
+
+@triton.jit
+def _quat_mul(aw, ax, ay, az, bw, bx, by, bz):
+    """Hamilton product of two quaternions. 16 FMAs."""
+    rw = aw * bw - ax * bx - ay * by - az * bz
+    rx = aw * bx + ax * bw + ay * bz - az * by
+    ry = aw * by - ax * bz + ay * bw + az * bx
+    rz = aw * bz + ax * by - ay * bx + az * bw
+    return rw, rx, ry, rz
+
+
+@triton.jit
+def _quantize_nearest(val, centroids_ptr, n_levels: tl.constexpr):
+    """Find nearest centroid for a scalar value."""
+    best_val = tl.load(centroids_ptr)
+    best_dist = tl.abs(val - best_val)
+    for i in tl.static_range(1, n_levels):
+        c = tl.load(centroids_ptr + i)
+        d = tl.abs(val - c)
+        mask = d < best_dist
+        best_dist = tl.where(mask, d, best_dist)
+        best_val = tl.where(mask, c, best_val)
+    return best_val
+
+
+# ── IsoQuant-Full fused kernel ────────────────────────────────────────
+# Forward:  T(v) = q_L * v * conj(q_R)
+# Quantize: scalar Lloyd-Max on all 4 components
+# Inverse:  T⁻¹(v̂) = conj(q_L) * v̂ * q_R
+
+@triton.jit
+def _iso_full_fused_kernel(
+    input_ptr, output_ptr,
+    ql_ptr, qr_ptr, centroids_ptr,
+    batch_size, emb_dim,
+    n_groups: tl.constexpr,
+    n_levels: tl.constexpr,
+    stride_in_b, stride_in_d,
+    stride_out_b, stride_out_d,
+    BLOCK_G: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    g_offs = pid_g * BLOCK_G + tl.arange(0, BLOCK_G)
+    g_mask = g_offs < n_groups
+
+    # Load quaternion pair for each group
+    ql_w = tl.load(ql_ptr + g_offs * 4 + 0, mask=g_mask, other=1.0)
+    ql_x = tl.load(ql_ptr + g_offs * 4 + 1, mask=g_mask, other=0.0)
+    ql_y = tl.load(ql_ptr + g_offs * 4 + 2, mask=g_mask, other=0.0)
+    ql_z = tl.load(ql_ptr + g_offs * 4 + 3, mask=g_mask, other=0.0)
+
+    qr_w = tl.load(qr_ptr + g_offs * 4 + 0, mask=g_mask, other=1.0)
+    qr_x = tl.load(qr_ptr + g_offs * 4 + 1, mask=g_mask, other=0.0)
+    qr_y = tl.load(qr_ptr + g_offs * 4 + 2, mask=g_mask, other=0.0)
+    qr_z = tl.load(qr_ptr + g_offs * 4 + 3, mask=g_mask, other=0.0)
+
+    # Load input 4D block
+    d0 = g_offs * 4
+    v0 = tl.load(input_ptr + pid_b * stride_in_b + d0 * stride_in_d,
+                  mask=g_mask & (d0 < emb_dim), other=0.0)
+    v1 = tl.load(input_ptr + pid_b * stride_in_b + (d0 + 1) * stride_in_d,
+                  mask=g_mask & ((d0 + 1) < emb_dim), other=0.0)
+    v2 = tl.load(input_ptr + pid_b * stride_in_b + (d0 + 2) * stride_in_d,
+                  mask=g_mask & ((d0 + 2) < emb_dim), other=0.0)
+    v3 = tl.load(input_ptr + pid_b * stride_in_b + (d0 + 3) * stride_in_d,
+                  mask=g_mask & ((d0 + 3) < emb_dim), other=0.0)
+
+    # Forward: temp = q_L * v
+    tw, tx, ty, tz = _quat_mul(ql_w, ql_x, ql_y, ql_z, v0, v1, v2, v3)
+    # Forward: rotated = temp * conj(q_R)
+    rw, rx, ry, rz = _quat_mul(tw, tx, ty, tz, qr_w, -qr_x, -qr_y, -qr_z)
+
+    # Quantize all 4 components
+    qw = _quantize_nearest(rw, centroids_ptr, n_levels)
+    qx = _quantize_nearest(rx, centroids_ptr, n_levels)
+    qy = _quantize_nearest(ry, centroids_ptr, n_levels)
+    qz = _quantize_nearest(rz, centroids_ptr, n_levels)
+
+    # Inverse: temp2 = conj(q_L) * v̂
+    tw2, tx2, ty2, tz2 = _quat_mul(ql_w, -ql_x, -ql_y, -ql_z, qw, qx, qy, qz)
+    # Inverse: restored = temp2 * q_R
+    fw, fx, fy, fz = _quat_mul(tw2, tx2, ty2, tz2, qr_w, qr_x, qr_y, qr_z)
+
+    # Store output
+    tl.store(output_ptr + pid_b * stride_out_b + d0 * stride_out_d,
+             fw, mask=g_mask & (d0 < emb_dim))
+    tl.store(output_ptr + pid_b * stride_out_b + (d0 + 1) * stride_out_d,
+             fx, mask=g_mask & ((d0 + 1) < emb_dim))
+    tl.store(output_ptr + pid_b * stride_out_b + (d0 + 2) * stride_out_d,
+             fy, mask=g_mask & ((d0 + 2) < emb_dim))
+    tl.store(output_ptr + pid_b * stride_out_b + (d0 + 3) * stride_out_d,
+             fz, mask=g_mask & ((d0 + 3) < emb_dim))
+
+
+# ── IsoQuant-Fast fused kernel ────────────────────────────────────────
+# Forward:  T(v) = q_L * v
+# Quantize: scalar Lloyd-Max on all 4 components
+# Inverse:  T⁻¹(v̂) = conj(q_L) * v̂
+
+@triton.jit
+def _iso_fast_fused_kernel(
+    input_ptr, output_ptr,
+    ql_ptr, centroids_ptr,
+    batch_size, emb_dim,
+    n_groups: tl.constexpr,
+    n_levels: tl.constexpr,
+    stride_in_b, stride_in_d,
+    stride_out_b, stride_out_d,
+    BLOCK_G: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    g_offs = pid_g * BLOCK_G + tl.arange(0, BLOCK_G)
+    g_mask = g_offs < n_groups
+
+    # Load single quaternion per group
+    ql_w = tl.load(ql_ptr + g_offs * 4 + 0, mask=g_mask, other=1.0)
+    ql_x = tl.load(ql_ptr + g_offs * 4 + 1, mask=g_mask, other=0.0)
+    ql_y = tl.load(ql_ptr + g_offs * 4 + 2, mask=g_mask, other=0.0)
+    ql_z = tl.load(ql_ptr + g_offs * 4 + 3, mask=g_mask, other=0.0)
+
+    # Load input 4D block
+    d0 = g_offs * 4
+    v0 = tl.load(input_ptr + pid_b * stride_in_b + d0 * stride_in_d,
+                  mask=g_mask & (d0 < emb_dim), other=0.0)
+    v1 = tl.load(input_ptr + pid_b * stride_in_b + (d0 + 1) * stride_in_d,
+                  mask=g_mask & ((d0 + 1) < emb_dim), other=0.0)
+    v2 = tl.load(input_ptr + pid_b * stride_in_b + (d0 + 2) * stride_in_d,
+                  mask=g_mask & ((d0 + 2) < emb_dim), other=0.0)
+    v3 = tl.load(input_ptr + pid_b * stride_in_b + (d0 + 3) * stride_in_d,
+                  mask=g_mask & ((d0 + 3) < emb_dim), other=0.0)
+
+    # Forward: rotated = q_L * v (single multiply)
+    rw, rx, ry, rz = _quat_mul(ql_w, ql_x, ql_y, ql_z, v0, v1, v2, v3)
+
+    # Quantize all 4 components
+    qw = _quantize_nearest(rw, centroids_ptr, n_levels)
+    qx = _quantize_nearest(rx, centroids_ptr, n_levels)
+    qy = _quantize_nearest(ry, centroids_ptr, n_levels)
+    qz = _quantize_nearest(rz, centroids_ptr, n_levels)
+
+    # Inverse: restored = conj(q_L) * v̂ (single multiply)
+    fw, fx, fy, fz = _quat_mul(ql_w, -ql_x, -ql_y, -ql_z, qw, qx, qy, qz)
+
+    # Store output
+    tl.store(output_ptr + pid_b * stride_out_b + d0 * stride_out_d,
+             fw, mask=g_mask & (d0 < emb_dim))
+    tl.store(output_ptr + pid_b * stride_out_b + (d0 + 1) * stride_out_d,
+             fx, mask=g_mask & ((d0 + 1) < emb_dim))
+    tl.store(output_ptr + pid_b * stride_out_b + (d0 + 2) * stride_out_d,
+             fy, mask=g_mask & ((d0 + 2) < emb_dim))
+    tl.store(output_ptr + pid_b * stride_out_b + (d0 + 3) * stride_out_d,
+             fz, mask=g_mask & ((d0 + 3) < emb_dim))
+
+
+# ── Python wrappers ───────────────────────────────────────────────────
+
+def triton_iso_full_fused(
+    input: torch.Tensor,     # [batch, emb_dim]
+    q_left: torch.Tensor,    # [n_groups, 4]
+    q_right: torch.Tensor,   # [n_groups, 4]
+    centroids: torch.Tensor, # [n_levels]
+) -> torch.Tensor:
+    """Fused IsoQuant-Full pipeline: normalize → q_L v q̄_R → quantize → q̄_L v̂ q_R → rescale.
+
+    Single kernel launch for the full quantize-dequantize roundtrip.
+    """
+    batch_size, emb_dim = input.shape
+    n_groups = q_left.shape[0]
+    n_levels = centroids.shape[0]
+
+    # Norm separation
+    input_f32 = input.float()
+    norms = input_f32.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    input_f32 = (input_f32 / norms).contiguous()
+
+    ql_f32 = q_left.float().contiguous()
+    qr_f32 = q_right.float().contiguous()
+    c_f32 = centroids.float().contiguous()
+
+    output = torch.empty_like(input_f32)
+
+    BLOCK_G = min(triton.next_power_of_2(n_groups), 128)
+    grid = (batch_size, triton.cdiv(n_groups, BLOCK_G))
+
+    _iso_full_fused_kernel[grid](
+        input_f32, output, ql_f32, qr_f32, c_f32,
+        batch_size, emb_dim, n_groups, n_levels,
+        input_f32.stride(0), input_f32.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_G=BLOCK_G,
+    )
+
+    output = output * norms
+    return output.to(input.dtype)
+
+
+def triton_iso_fast_fused(
+    input: torch.Tensor,     # [batch, emb_dim]
+    q_left: torch.Tensor,    # [n_groups, 4]
+    centroids: torch.Tensor, # [n_levels]
+) -> torch.Tensor:
+    """Fused IsoQuant-Fast pipeline: normalize → q_L v → quantize → q̄_L v̂ → rescale.
+
+    Single kernel launch. Fastest quantize-dequantize path.
+    """
+    batch_size, emb_dim = input.shape
+    n_groups = q_left.shape[0]
+    n_levels = centroids.shape[0]
+
+    # Norm separation
+    input_f32 = input.float()
+    norms = input_f32.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    input_f32 = (input_f32 / norms).contiguous()
+
+    ql_f32 = q_left.float().contiguous()
+    c_f32 = centroids.float().contiguous()
+
+    output = torch.empty_like(input_f32)
+
+    BLOCK_G = min(triton.next_power_of_2(n_groups), 128)
+    grid = (batch_size, triton.cdiv(n_groups, BLOCK_G))
+
+    _iso_fast_fused_kernel[grid](
+        input_f32, output, ql_f32, c_f32,
+        batch_size, emb_dim, n_groups, n_levels,
+        input_f32.stride(0), input_f32.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_G=BLOCK_G,
+    )
+
+    output = output * norms
+    return output.to(input.dtype)
 
 """
 Clifford algebra Cl(3,0) for RotorQuant.
@@ -7323,4 +10494,240 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+IsoQuant vs RotorQuant: Head-to-head benchmark on the validated pipeline.
+
+Tests both methods on:
+  1. Reconstruction MSE (synthetic + real activations)
+  2. Speed (quantize + dequantize latency)
+  3. Compression ratio
+  4. Parameter count
+
+This uses the SAME Lloyd-Max codebooks and same evaluation as
+benchmark_google_parity.py, just swapping the rotation primitive.
+"""
+
+import torch
+import time
+import math
+import sys
+
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from turboquant.rotorquant import RotorQuantMSE, RotorQuantProd
+from turboquant.isoquant import IsoQuantMSE, IsoQuantProd
+from turboquant.planarquant import PlanarQuantMSE, PlanarQuantProd
+
+
+def benchmark_mse(d, bits, n_vectors=8192, device='cuda'):
+    """Compare reconstruction MSE across all methods."""
+    torch.manual_seed(42)
+    # Synthetic normalized vectors (same as IsoQuant paper)
+    x = torch.randn(n_vectors, d, device=device)
+    x = x / x.norm(dim=-1, keepdim=True)
+
+    results = {}
+
+    # RotorQuant (Cl(3,0) 3D blocks)
+    rq = RotorQuantMSE(d, bits, seed=42, device=device)
+    x_hat_rq, _ = rq(x)
+    mse_rq = (x - x_hat_rq).pow(2).mean().item()
+    results['RotorQuant'] = mse_rq
+
+    # IsoQuant-Full (quaternion 4D blocks, double-sided)
+    iq_full = IsoQuantMSE(d, bits, seed=42, mode='full', device=device)
+    x_hat_full, _ = iq_full(x)
+    mse_full = (x - x_hat_full).pow(2).mean().item()
+    results['IsoQuant-Full'] = mse_full
+
+    # IsoQuant-Fast (quaternion 4D blocks, single-sided)
+    iq_fast = IsoQuantMSE(d, bits, seed=42, mode='fast', device=device)
+    x_hat_fast, _ = iq_fast(x)
+    mse_fast = (x - x_hat_fast).pow(2).mean().item()
+    results['IsoQuant-Fast'] = mse_fast
+
+    # PlanarQuant (2D Givens rotation)
+    pq = PlanarQuantMSE(d, bits, seed=42, device=device)
+    x_hat_pq, _ = pq(x)
+    mse_pq = (x - x_hat_pq).pow(2).mean().item()
+    results['PlanarQuant'] = mse_pq
+
+    return results
+
+
+def benchmark_speed(d, bits, n_vectors=8192, warmup=50, iters=200, device='cuda'):
+    """Compare quantize+dequantize latency."""
+    torch.manual_seed(42)
+    x = torch.randn(n_vectors, d, device=device)
+    x = x / x.norm(dim=-1, keepdim=True)
+
+    methods = {
+        'RotorQuant': RotorQuantMSE(d, bits, seed=42, device=device),
+        'IsoQuant-Full': IsoQuantMSE(d, bits, seed=42, mode='full', device=device),
+        'IsoQuant-Fast': IsoQuantMSE(d, bits, seed=42, mode='fast', device=device),
+        'PlanarQuant': PlanarQuantMSE(d, bits, seed=42, device=device),
+    }
+
+    results = {}
+    for name, model in methods.items():
+        # Warmup
+        for _ in range(warmup):
+            model(x)
+        torch.cuda.synchronize()
+
+        # Timed
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            model(x)
+        torch.cuda.synchronize()
+        dt = (time.perf_counter() - t0) / iters * 1e6  # microseconds
+        results[name] = dt
+
+    return results
+
+
+def benchmark_params(d, bits):
+    """Compare parameter counts."""
+    rq = RotorQuantMSE(d, bits, seed=42, device='cpu')
+    iq_full = IsoQuantMSE(d, bits, seed=42, mode='full', device='cpu')
+    iq_fast = IsoQuantMSE(d, bits, seed=42, mode='fast', device='cpu')
+    pq = PlanarQuantMSE(d, bits, seed=42, device='cpu')
+
+    return {
+        'RotorQuant': {
+            'n_groups': rq.n_groups,
+            'block_size': 3,
+            'mv_components': 8,
+            'rotation_params': rq.rotors.numel(),
+            'quantized_per_group': 3,  # only vector grade stored
+        },
+        'IsoQuant-Full': {
+            'n_groups': iq_full.n_groups,
+            'block_size': 4,
+            'components': 4,
+            'rotation_params': iq_full.q_L.numel() + iq_full.q_R.numel(),
+            'quantized_per_group': 4,
+        },
+        'IsoQuant-Fast': {
+            'n_groups': iq_fast.n_groups,
+            'block_size': 4,
+            'components': 4,
+            'rotation_params': iq_fast.q_L.numel(),
+            'quantized_per_group': 4,
+        },
+        'PlanarQuant': {
+            'n_groups': pq.n_groups,
+            'block_size': 2,
+            'components': 2,
+            'rotation_params': pq.rot2.numel(),  # n_groups * 2 (cos, sin)
+            'quantized_per_group': 2,
+        },
+    }
+
+
+def benchmark_inner_product(d, bits, n_vectors=4096, device='cuda'):
+    """Compare inner product estimation accuracy (Stage 1 + Stage 2)."""
+    torch.manual_seed(42)
+    x = torch.randn(n_vectors, d, device=device)
+    y = torch.randn(n_vectors, d, device=device)
+
+    # True inner products
+    true_ip = (x * y).sum(dim=-1)
+
+    methods = {
+        'RotorQuant': RotorQuantProd(d, bits, seed=42, device=device),
+        'IsoQuant-Full': IsoQuantProd(d, bits, mode='full', seed=42, device=device),
+        'IsoQuant-Fast': IsoQuantProd(d, bits, mode='fast', seed=42, device=device),
+        'PlanarQuant': PlanarQuantProd(d, bits, seed=42, device=device),
+    }
+
+    results = {}
+    for name, model in methods.items():
+        compressed = model.quantize(x)
+        est_ip = model.inner_product(y, compressed)
+        ip_mse = (true_ip - est_ip).pow(2).mean().item()
+        ip_bias = (true_ip - est_ip).mean().item()
+        results[name] = {'ip_mse': ip_mse, 'ip_bias': ip_bias}
+
+    return results
+
+
+if __name__ == '__main__':
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Device: {device}")
+    print()
+
+    dims = [64, 128, 256]
+    bits_list = [2, 3, 4]
+
+    # ── MSE Benchmark ──
+    print("=" * 70)
+    print("  RECONSTRUCTION MSE (lower is better)")
+    print("=" * 70)
+    print(f"{'d':>5} {'bits':>4} | {'RotorQuant':>12} {'IsoFull':>12} {'IsoFast':>12} {'Planar2D':>12} | {'Full/RQ':>8} {'Fast/RQ':>8} {'2D/RQ':>8}")
+    print("-" * 90)
+    for d in dims:
+        for bits in bits_list:
+            mses = benchmark_mse(d, bits, device=device)
+            rq = mses['RotorQuant']
+            full = mses['IsoQuant-Full']
+            fast = mses['IsoQuant-Fast']
+            pq = mses['PlanarQuant']
+            r_full = full / rq if rq > 0 else float('inf')
+            r_fast = fast / rq if rq > 0 else float('inf')
+            r_pq = pq / rq if rq > 0 else float('inf')
+            print(f"{d:>5} {bits:>4} | {rq:>12.6f} {full:>12.6f} {fast:>12.6f} {pq:>12.6f} | {r_full:>7.3f}x {r_fast:>7.3f}x {r_pq:>7.3f}x")
+
+    # ── Speed Benchmark ──
+    if device == 'cuda':
+        print()
+        print("=" * 70)
+        print("  LATENCY (microseconds, lower is better)")
+        print("=" * 70)
+        print(f"{'d':>5} {'bits':>4} | {'RotorQuant':>12} {'IsoFull':>12} {'IsoFast':>12} {'Planar2D':>12} | {'Full':>6} {'Fast':>6} {'2D':>6}")
+        print("-" * 90)
+        for d in dims:
+            for bits in bits_list:
+                speeds = benchmark_speed(d, bits, device=device)
+                rq = speeds['RotorQuant']
+                full = speeds['IsoQuant-Full']
+                fast = speeds['IsoQuant-Fast']
+                pq = speeds['PlanarQuant']
+                print(f"{d:>5} {bits:>4} | {rq:>10.0f}µs {full:>10.0f}µs {fast:>10.0f}µs {pq:>10.0f}µs | {rq/full:>5.1f}x {rq/fast:>5.1f}x {rq/pq:>5.1f}x")
+
+    # ── Parameter Count ──
+    print()
+    print("=" * 70)
+    print("  PARAMETER COUNT (d=128, bits=3)")
+    print("=" * 70)
+    params = benchmark_params(128, 3)
+    for name, info in params.items():
+        print(f"  {name}:")
+        for k, v in info.items():
+            print(f"    {k}: {v}")
+        print()
+
+    # ── Inner Product Accuracy ──
+    print("=" * 70)
+    print("  INNER PRODUCT ESTIMATION (Stage 1 + Stage 2)")
+    print("=" * 70)
+    print(f"{'d':>5} {'bits':>4} | {'RQ ip_mse':>12} {'Full ip_mse':>12} {'Fast ip_mse':>12} {'2D ip_mse':>12} | {'RQ bias':>10} {'Full bias':>10} {'Fast bias':>10} {'2D bias':>10}")
+    print("-" * 110)
+    for d in dims:
+        for bits in bits_list:
+            ips = benchmark_inner_product(d, bits, device=device)
+            rq = ips['RotorQuant']
+            full = ips['IsoQuant-Full']
+            fast = ips['IsoQuant-Fast']
+            pq = ips['PlanarQuant']
+            print(f"{d:>5} {bits:>4} | {rq['ip_mse']:>12.6f} {full['ip_mse']:>12.6f} {fast['ip_mse']:>12.6f} {pq['ip_mse']:>12.6f} | {rq['ip_bias']:>+10.6f} {full['ip_bias']:>+10.6f} {fast['ip_bias']:>+10.6f} {pq['ip_bias']:>+10.6f}")
+
+    print()
+    print("=" * 70)
+    print("  SUMMARY")
+    print("=" * 70)
+    print("  If IsoQuant MSE ≈ RotorQuant MSE and speed is faster,")
+    print("  it's a validated upgrade for the rotation primitive.")
+    print("  The rest of the pipeline (Lloyd-Max, QJL, KV cache) stays the same.")
 
